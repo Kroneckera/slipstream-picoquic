@@ -31,8 +31,8 @@ extern "C" {
 #endif
 
 #define PICOQUIC_PACKET_LOOP_SOCKETS_MAX 4
-#define PICOQUIC_PACKET_LOOP_RECV_MAX 10
-#define PICOQUIC_PACKET_LOOP_SEND_MAX 10
+#define PICOQUIC_PACKET_LOOP_RECV_MAX 64
+#define PICOQUIC_PACKET_LOOP_SEND_MAX 64
 #define PICOQUIC_PACKET_LOOP_SEND_DELAY_MAX 2500
 
 typedef struct st_picoquic_socket_ctx_t {
@@ -137,6 +137,7 @@ typedef struct st_picoquic_packet_loop_param_t {
     int is_client;
     ssize_t (*decode)(void* slot_p, void* callback_ctx, unsigned char** dest_buf, const unsigned char* src_buf, size_t src_buf_len, struct sockaddr_storage *peer_addr, struct sockaddr_storage *local_addr);
     ssize_t (*encode)(void* slot_p, void* callback_ctx, unsigned char** dest_buf, const unsigned char* src_buf, size_t src_buf_len, size_t* segment_len, struct sockaddr_storage *peer_addr, struct sockaddr_storage *local_addr);
+    int (*should_replenish_polls)(void* callback_ctx);
     int64_t delay_max;
 } picoquic_packet_loop_param_t;
 
@@ -334,4 +335,3 @@ int picoquic_packet_loop_open_sockets(uint16_t local_port, int local_af, int soc
 }
 #endif
 #endif /* PICOQUIC_PACKET_LOOP_H */
-
