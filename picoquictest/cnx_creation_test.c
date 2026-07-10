@@ -448,6 +448,104 @@ static int prepare_by_unique_path_id_case(int probe_nat)
             }
         }
     }
+    if (ret == 0 && !probe_nat) {
+        picoquic_demote_path(cnx, 1, simulated_time, 0, NULL);
+        int demoted_index = picoquic_find_path_by_unique_id(
+            cnx, target_path_id);
+        if (demoted_index != 1 || !cnx->path[demoted_index]->path_is_demoted ||
+            cnx->path[demoted_index]->demotion_time <= simulated_time ||
+            cnx->path[demoted_index]->p_remote_cnxid != NULL) {
+            DBG_PRINTF("Demoted path fixture invalid: index=%d, count=%d",
+                demoted_index, cnx->nb_paths);
+            ret = -1;
+        }
+        else {
+            send_length = 17;
+            ret = picoquic_prepare_packet_by_unique_path_id(
+                cnx, target_path_id, simulated_time, send_buffer,
+                sizeof(send_buffer), &send_length, &addr_to, &addr_from,
+                &if_index, &send_msg_size);
+            if (ret != PICOQUIC_ERROR_PATH_ID_INVALID || send_length != 0) {
+                DBG_PRINTF("Demoted stable path returned %d, length=%zu",
+                    ret, send_length);
+                ret = -1;
+            }
+            else {
+                ret = 0;
+            }
+        }
+    }
+    if (ret == 0 && !probe_nat) {
+        const uint8_t selector_remote_cid[8] = {
+            0x40, 0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47
+        };
+        const uint8_t selector_reset_secret[PICOQUIC_RESET_SECRET_SIZE] = {
+            2
+        };
+        picoquic_connection_id_t selector_local_cid = {
+            { 0x50, 0x51, 0x52, 0x53, 0x54, 0x55, 0x56, 0x57 }, 8
+        };
+        picoquic_remote_cnxid_t* selector_remote_cnxid = NULL;
+        uint64_t selector_time = cnx->path[1]->demotion_time;
+        uint64_t next_wake_time = UINT64_MAX;
+
+        picoquic_delete_abandoned_paths(
+            cnx, selector_time, &next_wake_time);
+        next_wake_time = UINT64_MAX;
+        picoquic_delete_abandoned_paths(
+            cnx, selector_time, &next_wake_time);
+        int selector_index = picoquic_create_path(
+            cnx, selector_time, (const struct sockaddr*)&local[1],
+            (const struct sockaddr*)&peer[1], 4);
+        if (cnx->nb_paths != 2 || selector_index != 1 ||
+            cnx->path[0] != default_path || cnx->path_demotion_needed) {
+            DBG_PRINTF("Selector-demoted path index is %d, count=%d, unsettled=%u",
+                selector_index, cnx->nb_paths, cnx->path_demotion_needed);
+            ret = -1;
+        }
+        else {
+            picoquic_path_t* selector_path = cnx->path[selector_index];
+            uint64_t selector_path_id = selector_path->unique_path_id;
+            selector_path->p_local_cnxid = picoquic_create_local_cnxid(
+                cnx, selector_path_id, &selector_local_cid, selector_time);
+            if (selector_path->p_local_cnxid == NULL ||
+                picoquic_stash_remote_cnxid(
+                    cnx, 0, selector_path_id, 0,
+                    sizeof(selector_remote_cid), selector_remote_cid,
+                    selector_reset_secret, &selector_remote_cnxid) != 0 ||
+                selector_remote_cnxid == NULL) {
+                DBG_PRINTF("%s", "Could not assign selector-demoted path CIDs");
+                ret = -1;
+            }
+            else {
+                size_t unprepared_msg_size = (size_t)-1;
+                selector_path->p_remote_cnxid = selector_remote_cnxid;
+                selector_remote_cnxid->nb_path_references++;
+                selector_path->challenge_failed = 1;
+                send_length = 17;
+                send_msg_size = unprepared_msg_size;
+                ret = picoquic_prepare_packet_by_unique_path_id(
+                    cnx, selector_path_id, selector_time, send_buffer,
+                    sizeof(send_buffer), &send_length, &addr_to, &addr_from,
+                    &if_index, &send_msg_size);
+                int resolved_index = picoquic_find_path_by_unique_id(
+                    cnx, selector_path_id);
+                if (ret != PICOQUIC_ERROR_PATH_ID_INVALID ||
+                    send_length != 0 || resolved_index != 1 ||
+                    !cnx->path[resolved_index]->path_is_demoted ||
+                    cnx->path[resolved_index]->demotion_time <= selector_time ||
+                    cnx->path[resolved_index]->p_remote_cnxid != NULL ||
+                    send_msg_size != unprepared_msg_size) {
+                    DBG_PRINTF("Selector-demoted stable path returned %d, length=%zu, index=%d, msg=%zu",
+                        ret, send_length, resolved_index, send_msg_size);
+                    ret = -1;
+                }
+                else {
+                    ret = 0;
+                }
+            }
+        }
+    }
     if (test_ctx != NULL) {
         tls_api_delete_ctx(test_ctx);
     }
