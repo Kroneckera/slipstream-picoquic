@@ -176,6 +176,9 @@ typedef enum {
     picoquic_state_disconnected
 } picoquic_state_enum;
 
+typedef uint64_t picoquic_cnx_handle_t;
+#define PICOQUIC_CNX_HANDLE_INVALID ((picoquic_cnx_handle_t)0)
+
 /* Packet contexts */
 typedef enum {
     picoquic_packet_context_application = 0,
@@ -995,6 +998,12 @@ picoquic_cnx_t* picoquic_get_earliest_cnx_to_wake(picoquic_quic_t* quic, uint64_
 uint64_t picoquic_get_next_wake_time(picoquic_quic_t* quic, uint64_t current_time);
 
 picoquic_state_enum picoquic_get_cnx_state(picoquic_cnx_t* cnx);
+picoquic_cnx_handle_t picoquic_get_cnx_handle(picoquic_cnx_t* cnx);
+/* The context and its connections must only be accessed from one thread. */
+int picoquic_get_cnx_state_by_handle(
+    picoquic_quic_t* quic,
+    picoquic_cnx_handle_t handle,
+    picoquic_state_enum* state_out);
 
 void picoquic_cnx_set_padding_policy(picoquic_cnx_t * cnx, uint32_t padding_multiple, uint32_t padding_minsize);
 void picoquic_cnx_get_padding_policy(picoquic_cnx_t * cnx, uint32_t * padding_multiple, uint32_t * padding_minsize);

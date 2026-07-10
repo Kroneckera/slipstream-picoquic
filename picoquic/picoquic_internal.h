@@ -680,6 +680,7 @@ typedef struct st_picoquic_quic_t {
 
     struct st_picoquic_cnx_t* cnx_list;
     struct st_picoquic_cnx_t* cnx_last;
+    picoquic_cnx_handle_t next_cnx_handle;
     picosplay_tree_t cnx_wake_tree;
 
     struct st_picoquic_cnx_t* cnx_in_progress;
@@ -1247,6 +1248,7 @@ typedef struct st_picoquic_crypto_context_t {
 */
 typedef struct st_picoquic_cnx_t {
     picoquic_quic_t* quic;
+    picoquic_cnx_handle_t cnx_handle;
 
     /* Management of context retrieval tables */
 

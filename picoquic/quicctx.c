@@ -657,6 +657,7 @@ picoquic_quic_t* picoquic_create(uint32_t max_nb_connections,
         quic->default_datagram_priority = PICOQUIC_DEFAULT_STREAM_PRIORITY;
         quic->cwin_max = UINT64_MAX;
         quic->sequence_hole_pseudo_period = PICOQUIC_DEFAULT_HOLE_PERIOD;
+        quic->next_cnx_handle = 1;
 
         picoquic_init_transport_parameters(&quic->default_tp, 0);
 
@@ -3671,13 +3672,24 @@ picoquic_cnx_t* picoquic_create_cnx(picoquic_quic_t* quic,
     const struct sockaddr* addr_to, uint64_t start_time, uint32_t preferred_version,
     char const* sni, char const* alpn, char client_mode)
 {
-    picoquic_cnx_t* cnx = (picoquic_cnx_t*)malloc(sizeof(picoquic_cnx_t));
+    picoquic_cnx_handle_t cnx_handle;
+    picoquic_cnx_t* cnx;
+
+    if (quic == NULL || quic->next_cnx_handle == PICOQUIC_CNX_HANDLE_INVALID) {
+        return NULL;
+    }
+    cnx_handle = quic->next_cnx_handle;
+    quic->next_cnx_handle = cnx_handle == UINT64_MAX
+        ? PICOQUIC_CNX_HANDLE_INVALID
+        : cnx_handle + 1;
+    cnx = (picoquic_cnx_t*)malloc(sizeof(picoquic_cnx_t));
 
     if (cnx != NULL) {
         int ret;
         picoquic_local_cnxid_t* cnxid0;
 
         memset(cnx, 0, sizeof(picoquic_cnx_t));
+        cnx->cnx_handle = cnx_handle;
         cnx->start_time = start_time;
         cnx->phase_delay = INT64_MAX;
         cnx->client_mode = client_mode;
@@ -4080,6 +4092,31 @@ uint64_t picoquic_get_cnx_start_time(picoquic_cnx_t* cnx)
 picoquic_state_enum picoquic_get_cnx_state(picoquic_cnx_t* cnx)
 {
     return cnx->cnx_state;
+}
+
+picoquic_cnx_handle_t picoquic_get_cnx_handle(picoquic_cnx_t* cnx)
+{
+    return cnx == NULL ? PICOQUIC_CNX_HANDLE_INVALID : cnx->cnx_handle;
+}
+
+int picoquic_get_cnx_state_by_handle(
+    picoquic_quic_t* quic,
+    picoquic_cnx_handle_t handle,
+    picoquic_state_enum* state_out)
+{
+    picoquic_cnx_t* cnx;
+
+    if (quic == NULL || handle == PICOQUIC_CNX_HANDLE_INVALID ||
+        state_out == NULL) {
+        return -1;
+    }
+    for (cnx = quic->cnx_list; cnx != NULL; cnx = cnx->next_in_table) {
+        if (cnx->cnx_handle == handle) {
+            *state_out = cnx->cnx_state;
+            return 0;
+        }
+    }
+    return -1;
 }
 
 int picoquic_is_0rtt_available(picoquic_cnx_t* cnx)

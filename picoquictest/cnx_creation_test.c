@@ -234,6 +234,214 @@ int create_cnx_test()
     return ret;
 }
 
+static picoquic_cnx_t* cnx_handle_create_connection(
+    picoquic_quic_t* quic,
+    uint8_t address_suffix)
+{
+    struct sockaddr_in addr = { 0 };
+    uint8_t* address_bytes = (uint8_t*)&addr.sin_addr;
+
+    addr.sin_family = AF_INET;
+    addr.sin_port = 4433;
+    address_bytes[0] = 192;
+    address_bytes[1] = 0;
+    address_bytes[2] = 2;
+    address_bytes[3] = address_suffix;
+    return picoquic_create_cnx(
+        quic, picoquic_null_connection_id, picoquic_null_connection_id,
+        (const struct sockaddr*)&addr, 0, 0, NULL, NULL, 1);
+}
+
+static picoquic_cnx_t* cnx_handle_create_server_connection(
+    picoquic_quic_t* quic,
+    picoquic_connection_id_t initial_cid,
+    uint8_t address_suffix)
+{
+    struct sockaddr_in addr = { 0 };
+    uint8_t* address_bytes = (uint8_t*)&addr.sin_addr;
+
+    addr.sin_family = AF_INET;
+    addr.sin_port = 4433;
+    address_bytes[0] = 192;
+    address_bytes[1] = 0;
+    address_bytes[2] = 2;
+    address_bytes[3] = address_suffix;
+    return picoquic_create_cnx(
+        quic, initial_cid, picoquic_null_connection_id,
+        (const struct sockaddr*)&addr, 0, PICOQUIC_V1_VERSION,
+        NULL, NULL, 0);
+}
+
+int cnx_handle_test()
+{
+    int ret = 0;
+    picoquic_quic_t* quic = picoquic_create(
+        8, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+        0, NULL, NULL, NULL, 0);
+    picoquic_cnx_t* cnx1 = NULL;
+    picoquic_cnx_t* cnx2 = NULL;
+    picoquic_cnx_t* replacement = NULL;
+    picoquic_cnx_handle_t handle1 = PICOQUIC_CNX_HANDLE_INVALID;
+    picoquic_cnx_handle_t handle2 = PICOQUIC_CNX_HANDLE_INVALID;
+    picoquic_cnx_handle_t replacement_handle = PICOQUIC_CNX_HANDLE_INVALID;
+    picoquic_state_enum state = picoquic_state_disconnected;
+
+    if (quic == NULL) {
+        return -1;
+    }
+    cnx1 = cnx_handle_create_connection(quic, 1);
+    cnx2 = cnx_handle_create_connection(quic, 2);
+    if (cnx1 == NULL || cnx2 == NULL) {
+        ret = -1;
+    }
+    else {
+        handle1 = picoquic_get_cnx_handle(cnx1);
+        handle2 = picoquic_get_cnx_handle(cnx2);
+        if (handle1 != 1 || handle2 != 2 || handle1 == handle2 ||
+            picoquic_get_cnx_state_by_handle(quic, handle1, &state) != 0 ||
+            state != picoquic_get_cnx_state(cnx1)) {
+            ret = -1;
+        }
+    }
+
+    if (ret == 0) {
+        picoquic_local_cnxid_t* retired = cnx1->path[0]->p_local_cnxid;
+        picoquic_local_cnxid_t* alternate = picoquic_create_local_cnxid(
+            cnx1, retired->path_id, NULL, 1);
+        picoquic_connection_id_t retired_id = retired->cnx_id;
+        uint64_t retired_path_id = retired->path_id;
+        uint64_t retired_sequence = retired->sequence;
+
+        if (alternate == NULL || alternate->registered_cnx != cnx1) {
+            ret = -1;
+        }
+        else {
+            picoquic_connection_id_t alternate_id = alternate->cnx_id;
+            picoquic_retire_local_cnxid(
+                cnx1, retired_path_id, retired_sequence);
+            if (picoquic_cnx_by_id_(quic, retired_id) != NULL ||
+                picoquic_cnx_by_id_(quic, alternate_id) != cnx1 ||
+                picoquic_get_cnx_state_by_handle(quic, handle1, &state) != 0 ||
+                state != picoquic_get_cnx_state(cnx1)) {
+                ret = -1;
+            }
+        }
+    }
+
+    if (ret == 0) {
+        cnx1->cnx_state = picoquic_state_ready;
+        if (picoquic_close(cnx1, 0) != 0 ||
+            picoquic_get_cnx_state_by_handle(quic, handle1, &state) != 0 ||
+            state != picoquic_state_disconnecting) {
+            ret = -1;
+        }
+    }
+
+    if (ret == 0) {
+        picoquic_delete_cnx(cnx1);
+        cnx1 = NULL;
+        state = picoquic_state_ready;
+        if (picoquic_get_cnx_state_by_handle(quic, handle1, &state) != -1 ||
+            state != picoquic_state_ready) {
+            ret = -1;
+        }
+    }
+
+    if (ret == 0) {
+        replacement = cnx_handle_create_connection(quic, 3);
+        replacement_handle = picoquic_get_cnx_handle(replacement);
+        if (replacement == NULL || replacement_handle != 3 ||
+            replacement_handle == handle1 || replacement_handle == handle2 ||
+            picoquic_get_cnx_state_by_handle(quic, handle1, &state) != -1 ||
+            picoquic_get_cnx_state_by_handle(
+                quic, replacement_handle, &state) != 0 ||
+            state != picoquic_get_cnx_state(replacement)) {
+            ret = -1;
+        }
+    }
+
+    if (ret == 0) {
+        state = picoquic_state_ready;
+        if (picoquic_get_cnx_handle(NULL) != PICOQUIC_CNX_HANDLE_INVALID ||
+            picoquic_get_cnx_state_by_handle(
+                quic, PICOQUIC_CNX_HANDLE_INVALID, &state) != -1 ||
+            state != picoquic_state_ready ||
+            picoquic_get_cnx_state_by_handle(quic, 42, &state) != -1 ||
+            state != picoquic_state_ready ||
+            picoquic_get_cnx_state_by_handle(NULL, handle2, &state) != -1 ||
+            state != picoquic_state_ready ||
+            picoquic_get_cnx_state_by_handle(quic, handle2, NULL) != -1) {
+            ret = -1;
+        }
+    }
+
+    picoquic_free(quic);
+
+    if (ret == 0) {
+        const picoquic_connection_id_t duplicate_icid = TEST_CNX_ID(0x44);
+        picoquic_cnx_t* registered_server;
+        picoquic_cnx_t* failed_duplicate;
+        picoquic_cnx_t* after_failure;
+
+        quic = picoquic_create(
+            4, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+            0, NULL, NULL, NULL, 0);
+        if (quic == NULL) {
+            ret = -1;
+        }
+        else {
+            registered_server = cnx_handle_create_server_connection(
+                quic, duplicate_icid, 9);
+            failed_duplicate = cnx_handle_create_server_connection(
+                quic, duplicate_icid, 9);
+            after_failure = cnx_handle_create_connection(quic, 10);
+            if (registered_server == NULL ||
+                picoquic_get_cnx_handle(registered_server) != 1 ||
+                failed_duplicate != NULL || quic->next_cnx_handle != 4 ||
+                after_failure == NULL ||
+                picoquic_get_cnx_handle(after_failure) != 3 ||
+                picoquic_get_cnx_state_by_handle(quic, 2, &state) != -1 ||
+                picoquic_get_cnx_state_by_handle(quic, 3, &state) != 0 ||
+                state != picoquic_get_cnx_state(after_failure)) {
+                ret = -1;
+            }
+            picoquic_free(quic);
+        }
+    }
+
+    if (ret == 0) {
+        picoquic_cnx_t* max_cnx;
+        quic = picoquic_create(
+            4, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+            0, NULL, NULL, NULL, 0);
+        if (quic == NULL) {
+            ret = -1;
+        }
+        else {
+            quic->next_cnx_handle = UINT64_MAX;
+            max_cnx = cnx_handle_create_connection(quic, 4);
+            if (max_cnx == NULL ||
+                picoquic_get_cnx_handle(max_cnx) != UINT64_MAX ||
+                quic->next_cnx_handle != PICOQUIC_CNX_HANDLE_INVALID) {
+                ret = -1;
+            }
+            else {
+                picoquic_delete_cnx(max_cnx);
+                for (int i = 0; ret == 0 && i < 3; i++) {
+                    if (cnx_handle_create_connection(
+                            quic, (uint8_t)(5 + i)) != NULL ||
+                        quic->next_cnx_handle != PICOQUIC_CNX_HANDLE_INVALID) {
+                        ret = -1;
+                    }
+                }
+            }
+            picoquic_free(quic);
+        }
+    }
+
+    return ret;
+}
+
 static void prepare_by_unique_path_id_clear_misc_frames(picoquic_cnx_t* cnx)
 {
     while (cnx->first_misc_frame != NULL) {
