@@ -455,12 +455,35 @@ static int prepare_by_unique_path_id_case(int probe_nat)
         }
     }
     if (ret == 0) {
-        int disappearing_index = picoquic_create_path(
+        int disappearing_index;
+        uint64_t due_wake_time = picoquic_get_quic_time(cnx->quic);
+        uint64_t expected_future_wake = cnx->start_time +
+            cnx->local_parameters.max_idle_timeout * 1000ull;
+        int missing_ret[3] = { 0, 0, 0 };
+        size_t missing_length[3] = { 0, 0, 0 };
+        uint64_t missing_wake[3] = { 0, 0, 0 };
+        int missing_queue[3] = { 0, 0, 0 };
+
+        cnx->app_wake_time = 0;
+        cnx->is_lost_feedback_notification_required = 0;
+        prepare_by_unique_path_id_clear_misc_frames(cnx);
+        picoquic_reinsert_by_wake_time(
+            cnx->quic, cnx, due_wake_time);
+        disappearing_index = picoquic_create_path(
             cnx, simulated_time, (const struct sockaddr*)&local[1],
             (const struct sockaddr*)&peer[1], 3);
-        if (disappearing_index != 2) {
-            DBG_PRINTF("Disappearing path index is %d, expected 2",
-                disappearing_index);
+        if (disappearing_index != 2 || cnx->first_misc_frame != NULL ||
+            cnx->last_misc_frame != NULL ||
+            cnx->cnx_state >= picoquic_state_ready ||
+            cnx->quic->default_handshake_timeout != 0 ||
+            cnx->local_parameters.max_idle_timeout == 0 ||
+            expected_future_wake <= due_wake_time) {
+            DBG_PRINTF("Disappearing path fixture invalid: index=%d, queue=%d/%d, state=%d, timeout=%" PRIu64 "/%" PRIu64 ", wake=%" PRIu64 "/%" PRIu64,
+                disappearing_index, cnx->first_misc_frame != NULL,
+                cnx->last_misc_frame != NULL, cnx->cnx_state,
+                cnx->quic->default_handshake_timeout,
+                cnx->local_parameters.max_idle_timeout,
+                due_wake_time, expected_future_wake);
             ret = -1;
         }
         else {
@@ -469,18 +492,102 @@ static int prepare_by_unique_path_id_case(int probe_nat)
             cnx->path[disappearing_index]->path_is_demoted = 1;
             cnx->path[disappearing_index]->demotion_time = simulated_time;
             cnx->path_demotion_needed = 1;
-            send_length = 17;
-            ret = picoquic_prepare_packet_by_unique_path_id(
-                cnx, disappearing_path_id, simulated_time, send_buffer,
-                sizeof(send_buffer), &send_length, &addr_to, &addr_from,
-                &if_index, &send_msg_size);
-            if (ret != PICOQUIC_ERROR_PATH_ID_INVALID || send_length != 0) {
-                DBG_PRINTF("Deleted stable path returned %d, length=%zu",
-                    ret, send_length);
+            for (int i = 0; i < 3; i++) {
+                send_length = 17;
+                missing_ret[i] = picoquic_prepare_packet_by_unique_path_id(
+                    cnx, disappearing_path_id, simulated_time, send_buffer,
+                    sizeof(send_buffer), &send_length, &addr_to, &addr_from,
+                    &if_index, &send_msg_size);
+                missing_length[i] = send_length;
+                missing_wake[i] = cnx->next_wake_time;
+                missing_queue[i] = cnx->first_misc_frame != NULL ||
+                    cnx->last_misc_frame != NULL;
+            }
+            for (int i = 0; ret == 0 && i < 3; i++) {
+                if (missing_ret[i] != PICOQUIC_ERROR_PATH_ID_INVALID ||
+                    missing_length[i] != 0 ||
+                    missing_wake[i] != expected_future_wake ||
+                    missing_queue[i]) {
+                    ret = -1;
+                }
+            }
+            if (ret != 0) {
+                DBG_PRINTF("Repeated missing stable path: ret=%d/%d/%d, length=%zu/%zu/%zu, wake=%" PRIu64 "/%" PRIu64 "/%" PRIu64 ", expected=%" PRIu64 ", due=%" PRIu64 ", queue=%d/%d/%d",
+                    missing_ret[0], missing_ret[1], missing_ret[2],
+                    missing_length[0], missing_length[1], missing_length[2],
+                    missing_wake[0], missing_wake[1], missing_wake[2],
+                    expected_future_wake, due_wake_time,
+                    missing_queue[0], missing_queue[1], missing_queue[2]);
+            }
+        }
+    }
+    if (ret == 0) {
+        const uint8_t queued_remote_cid[8] = {
+            0x60, 0x61, 0x62, 0x63, 0x64, 0x65, 0x66, 0x67
+        };
+        const uint8_t queued_reset_secret[PICOQUIC_RESET_SECRET_SIZE] = {
+            3
+        };
+        picoquic_remote_cnxid_t* queued_remote_cnxid = NULL;
+        int queued_index;
+        uint64_t expected_wake_time = picoquic_get_quic_time(cnx->quic);
+
+        prepare_by_unique_path_id_clear_misc_frames(cnx);
+        picoquic_reinsert_by_wake_time(cnx->quic, cnx, UINT64_MAX);
+        queued_index = picoquic_create_path(
+            cnx, simulated_time, (const struct sockaddr*)&local[1],
+            (const struct sockaddr*)&peer[1], 5);
+        if (queued_index != 2) {
+            DBG_PRINTF("Queued disappearing path index is %d, expected 2",
+                queued_index);
+            ret = -1;
+        }
+        else {
+            uint64_t queued_path_id =
+                cnx->path[queued_index]->unique_path_id;
+            if (picoquic_stash_remote_cnxid(
+                    cnx, 0, queued_path_id, 0,
+                    sizeof(queued_remote_cid), queued_remote_cid,
+                    queued_reset_secret, &queued_remote_cnxid) != 0 ||
+                queued_remote_cnxid == NULL) {
+                DBG_PRINTF("Could not assign queued path CID, index=%d",
+                    queued_index);
                 ret = -1;
             }
             else {
-                ret = 0;
+                cnx->path[queued_index]->p_remote_cnxid =
+                    queued_remote_cnxid;
+                queued_remote_cnxid->nb_path_references++;
+                picoquic_demote_path(
+                    cnx, queued_index, simulated_time, 0, NULL);
+            }
+            int queued_path_abandon =
+                prepare_by_unique_path_id_has_abandon_frame(
+                    cnx, queued_path_id);
+            unsigned int path_abandon_sent =
+                cnx->path[queued_index]->path_abandon_sent;
+            cnx->path[queued_index]->demotion_time = simulated_time;
+            send_length = 17;
+            int queued_ret = ret == 0 ?
+                picoquic_prepare_packet_by_unique_path_id(
+                    cnx, queued_path_id, simulated_time, send_buffer,
+                    sizeof(send_buffer), &send_length, &addr_to, &addr_from,
+                    &if_index, &send_msg_size) : ret;
+            int resolved_index = picoquic_find_path_by_unique_id(
+                cnx, queued_path_id);
+            if (queued_ret != PICOQUIC_ERROR_PATH_ID_INVALID ||
+                send_length != 0 || resolved_index >= 0 ||
+                !queued_path_abandon || !path_abandon_sent ||
+                cnx->first_misc_frame == NULL ||
+                cnx->next_wake_time != expected_wake_time ||
+                picoquic_get_earliest_cnx_to_wake(
+                    cnx->quic, expected_wake_time) != cnx) {
+                DBG_PRINTF("Queued missing stable path returned %d, length=%zu, index=%d, wake=%" PRIu64 "/%" PRIu64 ", queue=%d, abandon=%d/%u",
+                    queued_ret, send_length, resolved_index,
+                    cnx->next_wake_time, expected_wake_time,
+                    cnx->first_misc_frame != NULL, queued_path_abandon,
+                    path_abandon_sent);
+                ret = -1;
             }
         }
     }

@@ -4428,8 +4428,16 @@ static int picoquic_prepare_packet_internal(picoquic_cnx_t* cnx,
         if (use_unique_path_id) {
             resolved_path_id = picoquic_find_path_by_unique_id(
                 cnx, unique_path_id);
-            if (resolved_path_id < 0 ||
-                cnx->path[resolved_path_id]->path_is_demoted) {
+            if (resolved_path_id < 0) {
+                /* Cleanup may leave a PATH_ABANDON frame ready to send. */
+                if (cnx->first_misc_frame != NULL &&
+                    cnx->next_wake_time < next_wake_time) {
+                    next_wake_time = cnx->next_wake_time;
+                }
+                ret = PICOQUIC_ERROR_PATH_ID_INVALID;
+                goto prepare_packet_complete;
+            }
+            if (cnx->path[resolved_path_id]->path_is_demoted) {
                 /* Cleanup must not replace an earlier queued-work wake. */
                 if (cnx->next_wake_time < next_wake_time) {
                     next_wake_time = cnx->next_wake_time;
