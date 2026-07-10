@@ -20,6 +20,7 @@
 */
 
 #include "picoquic_internal.h"
+#include "picoquictest_internal.h"
 #include <stdlib.h>
 #ifdef _WINDOWS
 #include <malloc.h>
@@ -230,6 +231,242 @@ int create_cnx_test()
         }
     }
 
+    return ret;
+}
+
+static int prepare_by_unique_path_id_case(int probe_nat)
+{
+    const uint8_t normal_remote_cid[8] = {
+        0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17
+    };
+    const uint8_t nat_remote_cid[8] = {
+        0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27
+    };
+    const uint8_t reset_secret[PICOQUIC_RESET_SECRET_SIZE] = { 0 };
+    const uint8_t nat_reset_secret[PICOQUIC_RESET_SECRET_SIZE] = { 1 };
+    picoquic_connection_id_t local_cid = {
+        { 0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37 }, 8
+    };
+    picoquic_test_tls_api_ctx_t* test_ctx = NULL;
+    picoquic_cnx_t* cnx = NULL;
+    picoquic_path_t* default_path = NULL;
+    picoquic_path_t* target_path = NULL;
+    picoquic_remote_cnxid_t* remote_cnxid = NULL;
+    picoquic_remote_cnxid_t* remote_nat_cnxid = NULL;
+    struct sockaddr_in peer[3];
+    struct sockaddr_in local[3];
+    struct sockaddr_in nat_peer;
+    struct sockaddr_in nat_local;
+    struct sockaddr_storage addr_to;
+    struct sockaddr_storage addr_from;
+    uint8_t send_buffer[PICOQUIC_MAX_PACKET_SIZE];
+    uint64_t simulated_time = 0;
+    uint64_t loss_mask = 0;
+    uint64_t target_path_id = UINT64_MAX;
+    size_t send_length = 0;
+    size_t send_msg_size = 0;
+    int if_index = 0;
+    int obsolete_index = -1;
+    int target_index = -1;
+    int ret = tls_api_init_ctx(
+        &test_ctx, PICOQUIC_INTERNAL_TEST_VERSION_1, PICOQUIC_TEST_SNI,
+        PICOQUIC_TEST_ALPN, &simulated_time, NULL, NULL, 0, 0, 0);
+
+    if (ret == 0) {
+        ret = tls_api_connection_loop(
+            test_ctx, &loss_mask, 0, &simulated_time);
+    }
+    if (ret == 0 && (test_ctx == NULL || !TEST_CLIENT_READY)) {
+        DBG_PRINTF("TLS fixture not ready, ret=%d", ret);
+        ret = -1;
+    }
+    memset(peer, 0, sizeof(peer));
+    memset(local, 0, sizeof(local));
+    memset(&nat_peer, 0, sizeof(nat_peer));
+    memset(&nat_local, 0, sizeof(nat_local));
+    for (int i = 0; i < 3; i++) {
+        peer[i].sin_family = AF_INET;
+        peer[i].sin_port = htons((uint16_t)(5300 + i));
+        peer[i].sin_addr.s_addr = htonl(0x7f000001u + (uint32_t)i);
+        local[i].sin_family = AF_INET;
+        local[i].sin_port = htons((uint16_t)(45000 + i));
+        local[i].sin_addr.s_addr = htonl(0x7f00002au + (uint32_t)i);
+    }
+    nat_peer.sin_family = AF_INET;
+    nat_peer.sin_port = htons(6302);
+    nat_peer.sin_addr.s_addr = htonl(0x7f000062u);
+    nat_local.sin_family = AF_INET;
+    nat_local.sin_port = htons(46002);
+    nat_local.sin_addr.s_addr = htonl(0x7f000072u);
+
+    if (ret == 0) {
+        cnx = test_ctx->cnx_client;
+        default_path = cnx->path[0];
+        cnx->is_multipath_enabled = 1;
+        obsolete_index = picoquic_create_path(
+            cnx, simulated_time, (const struct sockaddr*)&local[1],
+            (const struct sockaddr*)&peer[1], 1);
+        target_index = picoquic_create_path(
+            cnx, simulated_time, (const struct sockaddr*)&local[2],
+            (const struct sockaddr*)&peer[2], 2);
+        if (obsolete_index != 1 || target_index != 2) {
+            DBG_PRINTF("Could not create paths: obsolete=%d, target=%d, count=%d",
+                obsolete_index, target_index, cnx->nb_paths);
+            ret = -1;
+        }
+    }
+    if (ret == 0) {
+        target_path = cnx->path[2];
+        target_path_id = target_path->unique_path_id;
+        target_path->if_index_dest = 22;
+        target_path->p_local_cnxid = picoquic_create_local_cnxid(
+            cnx, target_path_id, &local_cid, simulated_time);
+        if (target_path->p_local_cnxid == NULL ||
+            picoquic_stash_remote_cnxid(
+                cnx, 0, target_path_id, 0, sizeof(normal_remote_cid),
+                normal_remote_cid, reset_secret, &remote_cnxid) != 0 ||
+            remote_cnxid == NULL) {
+            DBG_PRINTF("%s", "Could not assign target path CIDs");
+            ret = -1;
+        }
+        else {
+            target_path->p_remote_cnxid = remote_cnxid;
+            remote_cnxid->nb_path_references++;
+        }
+    }
+    if (ret == 0 && probe_nat) {
+        picoquic_store_addr(
+            &target_path->nat_peer_addr,
+            (const struct sockaddr*)&nat_peer);
+        picoquic_store_addr(
+            &target_path->nat_local_addr,
+            (const struct sockaddr*)&nat_local);
+        target_path->if_index_nat_dest = 44;
+        target_path->challenge_repeat_count = 1;
+        target_path->challenge_time = simulated_time;
+        target_path->nat_challenge_repeat_count = 0;
+        target_path->nat_challenge[0] = 0x0123456789abcdefull;
+        if (picoquic_stash_remote_cnxid(
+                cnx, 0, target_path_id, 1, sizeof(nat_remote_cid),
+                nat_remote_cid, nat_reset_secret, &remote_nat_cnxid) != 0 ||
+            remote_nat_cnxid == NULL) {
+            DBG_PRINTF("%s", "Could not assign target NAT CID");
+            ret = -1;
+        }
+        else {
+            target_path->p_remote_nat_cnxid = remote_nat_cnxid;
+            remote_nat_cnxid->nb_path_references++;
+        }
+    }
+    if (ret == 0) {
+        cnx->path[1]->path_is_demoted = 1;
+        cnx->path[1]->demotion_time = simulated_time;
+        cnx->path_demotion_needed = 1;
+    }
+    if (ret == 0) {
+        const struct sockaddr* expected_to = probe_nat ?
+            (const struct sockaddr*)&nat_peer :
+            (const struct sockaddr*)&peer[2];
+        const struct sockaddr* expected_from = probe_nat ?
+            (const struct sockaddr*)&nat_local :
+            (const struct sockaddr*)&local[2];
+        const uint8_t* expected_cid = probe_nat ?
+            nat_remote_cid : normal_remote_cid;
+        int expected_if_index = probe_nat ? 44 : 22;
+
+        ret = picoquic_prepare_packet_by_unique_path_id(
+            cnx, target_path_id, simulated_time, send_buffer,
+            sizeof(send_buffer), &send_length, &addr_to, &addr_from,
+            &if_index, &send_msg_size);
+        if (ret != 0) {
+            DBG_PRINTF("Target stable path returned %d, nat=%d", ret,
+                probe_nat);
+        }
+        if (ret == 0 &&
+            (send_length <= 1 + sizeof(normal_remote_cid) ||
+             (send_buffer[0] & 0x80) != 0 ||
+             memcmp(send_buffer + 1, expected_cid,
+                 sizeof(normal_remote_cid)) != 0 ||
+             cnx->path[0] != default_path || cnx->nb_paths != 2 ||
+             cnx->path[1] != target_path ||
+             picoquic_compare_addr(
+                 (const struct sockaddr*)&addr_to, expected_to) != 0 ||
+             picoquic_compare_addr(
+                 (const struct sockaddr*)&addr_from, expected_from) != 0 ||
+             if_index != expected_if_index)) {
+            DBG_PRINTF("Unique path route mismatch, nat=%d, length=%zu, if=%d/%d, cid=%d, to=%d, from=%d",
+                probe_nat, send_length, if_index, expected_if_index,
+                send_length > 1 + sizeof(normal_remote_cid) ?
+                    memcmp(send_buffer + 1, expected_cid,
+                        sizeof(normal_remote_cid)) : -1,
+                picoquic_compare_addr(
+                    (const struct sockaddr*)&addr_to, expected_to),
+                picoquic_compare_addr(
+                    (const struct sockaddr*)&addr_from, expected_from));
+            ret = -1;
+        }
+    }
+    if (ret == 0) {
+        send_length = 17;
+        ret = picoquic_prepare_packet_by_unique_path_id(
+            cnx, target_path_id, simulated_time, send_buffer,
+            sizeof(send_buffer), &send_length, &addr_to, &addr_from,
+            &if_index, &send_msg_size);
+        if (ret != 0 || send_length != 0) {
+            DBG_PRINTF("Unique path zero output returned %d, length=%zu, nat=%d",
+                ret, send_length, probe_nat);
+            ret = -1;
+        }
+    }
+    if (ret == 0) {
+        int disappearing_index = picoquic_create_path(
+            cnx, simulated_time, (const struct sockaddr*)&local[1],
+            (const struct sockaddr*)&peer[1], 3);
+        if (disappearing_index != 2) {
+            DBG_PRINTF("Disappearing path index is %d, expected 2",
+                disappearing_index);
+            ret = -1;
+        }
+        else {
+            uint64_t disappearing_path_id =
+                cnx->path[disappearing_index]->unique_path_id;
+            cnx->path[disappearing_index]->path_is_demoted = 1;
+            cnx->path[disappearing_index]->demotion_time = simulated_time;
+            cnx->path_demotion_needed = 1;
+            send_length = 17;
+            ret = picoquic_prepare_packet_by_unique_path_id(
+                cnx, disappearing_path_id, simulated_time, send_buffer,
+                sizeof(send_buffer), &send_length, &addr_to, &addr_from,
+                &if_index, &send_msg_size);
+            if (ret != PICOQUIC_ERROR_PATH_ID_INVALID || send_length != 0) {
+                DBG_PRINTF("Deleted stable path returned %d, length=%zu",
+                    ret, send_length);
+                ret = -1;
+            }
+            else {
+                ret = 0;
+            }
+        }
+    }
+    if (test_ctx != NULL) {
+        tls_api_delete_ctx(test_ctx);
+    }
+    return ret;
+}
+
+int prepare_by_unique_path_id_test()
+{
+    int ret = prepare_by_unique_path_id_case(0);
+
+    if (ret != 0) {
+        DBG_PRINTF("%s", "Normal unique path preparation failed");
+    }
+    if (ret == 0) {
+        ret = prepare_by_unique_path_id_case(1);
+        if (ret != 0) {
+            DBG_PRINTF("%s", "NAT unique path preparation failed");
+        }
+    }
     return ret;
 }
 

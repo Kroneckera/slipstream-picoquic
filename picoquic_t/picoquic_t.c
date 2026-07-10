@@ -61,6 +61,7 @@ static const picoquic_test_def_t test_table[] = {
     { "sockloop_thread_name", sockloop_thread_name_test },
     { "splay", splay_test },
     { "create_cnx", create_cnx_test },
+    { "prepare_by_unique_path_id", prepare_by_unique_path_id_test },
     { "create_quic", create_quic_test },
     { "parseheader", parseheadertest },
     { "incoming_initial", incoming_initial_test },

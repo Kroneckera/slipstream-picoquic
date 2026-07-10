@@ -4045,6 +4045,18 @@ static void picoquic_set_path_addresses(picoquic_cnx_t* cnx, int path_id, int is
     }
 }
 
+static uint64_t picoquic_path_challenge_schedule(picoquic_cnx_t* cnx,
+    picoquic_path_t* path_x, uint64_t current_time, unsigned int* is_nat)
+{
+    *is_nat = 0;
+    if (path_x->response_required || !path_x->challenge_required ||
+        path_x->challenge_verified) {
+        return UINT64_MAX;
+    }
+    return picoquic_next_challenge_time(
+        cnx, path_x, current_time, is_nat);
+}
+
 static int picoquic_select_next_path_mp(picoquic_cnx_t* cnx, uint64_t current_time, uint64_t* next_wake_time,
     struct sockaddr_storage * p_addr_to, struct sockaddr_storage * p_addr_from, int* if_index)
 {
@@ -4093,7 +4105,8 @@ static int picoquic_select_next_path_mp(picoquic_cnx_t* cnx, uint64_t current_ti
                 break;
             }
             else if (cnx->path[i]->challenge_required && !cnx->path[i]->challenge_verified) {
-                uint64_t next_challenge_time = picoquic_next_challenge_time(cnx, cnx->path[i], current_time, &is_nat);
+                uint64_t next_challenge_time = picoquic_path_challenge_schedule(
+                    cnx, cnx->path[i], current_time, &is_nat);
                 if (current_time >= next_challenge_time) {
                     cnx->path[i]->challenger++;
                     cnx->path[i]->is_probing_nat = (is_nat) ? 1 : 0;
@@ -4365,7 +4378,8 @@ int picoquic_program_app_wake_time(picoquic_cnx_t* cnx, uint64_t* next_wake_time
 }
 
 /* Prepare next packet to send, or nothing.. */
-int picoquic_prepare_packet_ex(picoquic_cnx_t* cnx, int path_id_request,
+static int picoquic_prepare_packet_internal(picoquic_cnx_t* cnx,
+    int path_id_request, int use_unique_path_id, uint64_t unique_path_id,
     uint64_t current_time, uint8_t* send_buffer, size_t send_buffer_max, size_t* send_length,
     struct sockaddr_storage * p_addr_to, struct sockaddr_storage * p_addr_from, int* if_index, size_t* send_msg_size)
 {
@@ -4404,16 +4418,45 @@ int picoquic_prepare_packet_ex(picoquic_cnx_t* cnx, int path_id_request,
 
     if (ret == 0) {
         int path_id;
+        int resolved_path_id = path_id_request;
 
         /* Remove delete paths */
         if (cnx->path_demotion_needed) {
             picoquic_delete_abandoned_paths(cnx, current_time, &next_wake_time);
         }
 
+        if (use_unique_path_id) {
+            resolved_path_id = picoquic_find_path_by_unique_id(
+                cnx, unique_path_id);
+            if (resolved_path_id < 0) {
+                ret = PICOQUIC_ERROR_PATH_ID_INVALID;
+                goto prepare_packet_complete;
+            }
+        }
+
         /* Select the next path, and the corresponding addresses */
         path_id = picoquic_select_next_path(cnx, current_time, &next_wake_time, p_addr_to, p_addr_from, if_index);
-        if (path_id_request != -1) {
-            path_id = path_id_request;
+        if (use_unique_path_id) {
+            /* Selection can promote or swap paths. Resolve the stable request
+             * again immediately before consuming the array index. */
+            resolved_path_id = picoquic_find_path_by_unique_id(
+                cnx, unique_path_id);
+            if (resolved_path_id < 0) {
+                ret = PICOQUIC_ERROR_PATH_ID_INVALID;
+                goto prepare_packet_complete;
+            }
+            path_id = resolved_path_id;
+            unsigned int is_nat = 0;
+            uint64_t challenge_time = picoquic_path_challenge_schedule(
+                cnx, cnx->path[path_id], current_time, &is_nat);
+            cnx->path[path_id]->is_probing_nat =
+                (challenge_time <= current_time && is_nat) ? 1 : 0;
+            picoquic_set_path_addresses(
+                cnx, path_id, cnx->path[path_id]->is_probing_nat,
+                p_addr_to, p_addr_from, if_index);
+        }
+        else if (resolved_path_id != -1) {
+            path_id = resolved_path_id;
         }
 
         /* Send the available packets */
@@ -4570,6 +4613,7 @@ int picoquic_prepare_packet_ex(picoquic_cnx_t* cnx, int path_id_request,
         }
     }
 
+prepare_packet_complete:
     if (ret == 0) {
         ret = picoquic_program_app_wake_time(cnx, &next_wake_time);
     }
@@ -4577,6 +4621,29 @@ int picoquic_prepare_packet_ex(picoquic_cnx_t* cnx, int path_id_request,
     picoquic_reinsert_by_wake_time(cnx->quic, cnx, next_wake_time);
 
     return ret;
+}
+
+int picoquic_prepare_packet_ex(picoquic_cnx_t* cnx, int path_id_request,
+    uint64_t current_time, uint8_t* send_buffer, size_t send_buffer_max, size_t* send_length,
+    struct sockaddr_storage* p_addr_to, struct sockaddr_storage* p_addr_from, int* if_index,
+    size_t* send_msg_size)
+{
+    return picoquic_prepare_packet_internal(
+        cnx, path_id_request, 0, 0, current_time, send_buffer,
+        send_buffer_max, send_length, p_addr_to, p_addr_from, if_index,
+        send_msg_size);
+}
+
+int picoquic_prepare_packet_by_unique_path_id(picoquic_cnx_t* cnx,
+    uint64_t unique_path_id, uint64_t current_time, uint8_t* send_buffer,
+    size_t send_buffer_max, size_t* send_length,
+    struct sockaddr_storage* p_addr_to, struct sockaddr_storage* p_addr_from,
+    int* if_index, size_t* send_msg_size)
+{
+    return picoquic_prepare_packet_internal(
+        cnx, -1, 1, unique_path_id, current_time, send_buffer,
+        send_buffer_max, send_length, p_addr_to, p_addr_from, if_index,
+        send_msg_size);
 }
 
 int picoquic_prepare_packet(picoquic_cnx_t* cnx,
