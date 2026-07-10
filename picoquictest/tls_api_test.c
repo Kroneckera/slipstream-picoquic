@@ -493,8 +493,8 @@ static int test_api_direct_receive_callback(picoquic_cnx_t* cnx,
                 }
                 else {
                     while (hole != NULL) {
-                        previous_hole = ctx->test_stream[stream_index].first_direct_hole;
-                        hole = previous_hole->next_hole;
+                        previous_hole = hole;
+                        hole = hole->next_hole;
                     }
                     new_hole->offset = ctx->test_stream[stream_index].next_direct_offset;
                     new_hole->last_offset = offset;
@@ -604,6 +604,49 @@ static int test_api_direct_receive_callback(picoquic_cnx_t* cnx,
         }
     }
 
+    return ret;
+}
+
+static int test_api_direct_receive_multiple_holes_test()
+{
+    int ret = 0;
+    picoquic_test_tls_api_ctx_t test_ctx = { 0 };
+    test_api_stream_t* test_stream = &test_ctx.test_stream[0];
+
+    test_ctx.client_callback.client_mode = 1;
+    test_ctx.nb_test_streams = 1;
+    ret = test_api_init_test_stream(test_stream, 4, 0, 0, 20);
+
+    if (ret == 0) {
+        ret = test_api_direct_receive_callback(NULL, 4, 0,
+            test_stream->r_src + 4, 4, 2, &test_ctx.client_callback);
+    }
+    if (ret == 0) {
+        ret = test_api_direct_receive_callback(NULL, 4, 0,
+            test_stream->r_src + 10, 10, 2, &test_ctx.client_callback);
+    }
+    if (ret == 0) {
+        ret = test_api_direct_receive_callback(NULL, 4, 0,
+            test_stream->r_src + 14, 14, 2, &test_ctx.client_callback);
+    }
+    if (ret == 0 &&
+        (test_stream->first_direct_hole == NULL ||
+            test_stream->first_direct_hole->offset != 0 ||
+            test_stream->first_direct_hole->last_offset != 4 ||
+            test_stream->first_direct_hole->next_hole == NULL ||
+            test_stream->first_direct_hole->next_hole->offset != 6 ||
+            test_stream->first_direct_hole->next_hole->last_offset != 10 ||
+            test_stream->first_direct_hole->next_hole->next_hole == NULL ||
+            test_stream->first_direct_hole->next_hole->next_hole->offset != 12 ||
+            test_stream->first_direct_hole->next_hole->next_hole->last_offset != 14 ||
+            test_stream->first_direct_hole->next_hole->next_hole->next_hole != NULL ||
+            test_stream->next_direct_offset != 16 ||
+            test_stream->r_recv_nb != 6)) {
+        DBG_PRINTF("%s", "Direct receive did not retain three ordered holes.\n");
+        ret = -1;
+    }
+
+    test_api_delete_test_stream(test_stream);
     return ret;
 }
 
@@ -10065,14 +10108,16 @@ int quality_update_test()
 
 int direct_receive_test()
 {
-    int ret = 0;
+    int ret = test_api_direct_receive_multiple_holes_test();
     uint64_t simulated_time = 0;
     picoquic_test_tls_api_ctx_t* test_ctx = NULL;
     uint64_t loss_mask = 8;
     uint64_t max_completion_microsec = 3500000;
 
-    ret = tls_api_one_scenario_init(&test_ctx, &simulated_time,
-        0, NULL, NULL);
+    if (ret == 0) {
+        ret = tls_api_one_scenario_init(&test_ctx, &simulated_time,
+            0, NULL, NULL);
+    }
 
     if (ret == 0) {
         ret = tls_api_one_scenario_body_connect(test_ctx, &simulated_time, 0, 0, 0);
