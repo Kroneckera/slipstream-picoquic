@@ -1254,6 +1254,8 @@ typedef struct st_picoquic_cnx_t {
 
     struct st_picoquic_cnx_t* next_in_table;
     struct st_picoquic_cnx_t* previous_in_table;
+    unsigned int is_in_cnx_list : 1;
+    unsigned int is_in_wake_tree : 1;
 
     /* Proposed version, may be zero if there is no reference.
      * Rejected version that triggered reception of a Version negotiation packet, zero by default.

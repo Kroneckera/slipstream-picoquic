@@ -1313,10 +1313,14 @@ static void picoquic_insert_cnx_in_list(picoquic_quic_t* quic, picoquic_cnx_t* c
     quic->cnx_list = cnx;
     cnx->previous_in_table = NULL;
     quic->current_number_connections++;
+    cnx->is_in_cnx_list = 1;
 }
 
 static void picoquic_remove_cnx_from_list(picoquic_cnx_t* cnx)
 {
+    if (!cnx->is_in_cnx_list) {
+        return;
+    }
     if (cnx->next_in_table == NULL) {
         cnx->quic->cnx_last = cnx->previous_in_table;
     } else {
@@ -1334,6 +1338,9 @@ static void picoquic_remove_cnx_from_list(picoquic_cnx_t* cnx)
     picoquic_unregister_net_secret(cnx);
 
     cnx->quic->current_number_connections--;
+    cnx->next_in_table = NULL;
+    cnx->previous_in_table = NULL;
+    cnx->is_in_cnx_list = 0;
 }
 
 /* Management of the list of connections, sorted by wake time */
@@ -1372,12 +1379,17 @@ static void picoquic_wake_list_init(picoquic_quic_t * quic)
 
 static void picoquic_remove_cnx_from_wake_list(picoquic_cnx_t* cnx)
 {
-    picosplay_delete_hint(&cnx->quic->cnx_wake_tree, &cnx->cnx_wake_node);
+    if (cnx->is_in_wake_tree) {
+        picosplay_delete_hint(
+            &cnx->quic->cnx_wake_tree, &cnx->cnx_wake_node);
+        cnx->is_in_wake_tree = 0;
+    }
 }
 
 static void picoquic_insert_cnx_by_wake_time(picoquic_quic_t* quic, picoquic_cnx_t* cnx)
 {
     picosplay_insert(&quic->cnx_wake_tree, cnx);
+    cnx->is_in_wake_tree = 1;
 }
 
 void picoquic_reinsert_by_wake_time(picoquic_quic_t* quic, picoquic_cnx_t* cnx, uint64_t next_time)
@@ -3950,7 +3962,7 @@ picoquic_cnx_t* picoquic_create_cnx(picoquic_quic_t* quic,
         }
     }
 
-    if (quic->use_unique_log_names) {
+    if (cnx != NULL && quic->use_unique_log_names) {
         picoquic_crypto_random(quic, &cnx->log_unique, sizeof(cnx->log_unique));
     }
 

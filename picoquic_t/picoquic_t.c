@@ -62,6 +62,8 @@ static const picoquic_test_def_t test_table[] = {
     { "splay", splay_test },
     { "create_cnx", create_cnx_test },
     { "cnx_handle", cnx_handle_test },
+    { "cnx_preinsert_failure", cnx_preinsert_failure_test },
+    { "cnx_unique_log_failure", cnx_unique_log_failure_test },
     { "prepare_by_unique_path_id", prepare_by_unique_path_id_test },
     { "create_quic", create_quic_test },
     { "parseheader", parseheadertest },

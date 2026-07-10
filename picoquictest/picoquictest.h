@@ -45,6 +45,8 @@ int picohash_embedded_test();
 int bytestream_test();
 int create_cnx_test();
 int cnx_handle_test();
+int cnx_preinsert_failure_test();
+int cnx_unique_log_failure_test();
 int prepare_by_unique_path_id_test();
 int create_quic_test();
 int parseheadertest();

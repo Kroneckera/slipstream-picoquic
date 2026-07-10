@@ -272,6 +272,138 @@ static picoquic_cnx_t* cnx_handle_create_server_connection(
         NULL, NULL, 0);
 }
 
+static void cnx_failure_fixed_cid_callback(
+    picoquic_quic_t* quic,
+    picoquic_connection_id_t cnx_id_local,
+    picoquic_connection_id_t cnx_id_remote,
+    void* callback_context,
+    picoquic_connection_id_t* cnx_id_returned)
+{
+    (void)quic;
+    (void)cnx_id_local;
+    (void)cnx_id_remote;
+    *cnx_id_returned = *(const picoquic_connection_id_t*)callback_context;
+}
+
+static int cnx_failure_survivor_is_intact(
+    picoquic_quic_t* quic,
+    picoquic_cnx_t* survivor,
+    picoquic_cnx_handle_t survivor_handle,
+    int* state_result)
+{
+    picoquic_state_enum state = picoquic_state_disconnected;
+
+    *state_result = picoquic_get_cnx_state_by_handle(
+        quic, survivor_handle, &state);
+    return *state_result == 0 && state == picoquic_get_cnx_state(survivor) &&
+        quic->cnx_list == survivor && quic->cnx_last == survivor &&
+        quic->current_number_connections == 1 &&
+        quic->cnx_wake_tree.size == 1 &&
+        picoquic_get_earliest_cnx_to_wake(quic, UINT64_MAX) == survivor;
+}
+
+static void cnx_failure_restore_survivor_for_cleanup(
+    picoquic_quic_t* quic,
+    picoquic_cnx_t* survivor)
+{
+    quic->cnx_list = survivor;
+    quic->cnx_last = survivor;
+    quic->current_number_connections = 1;
+    survivor->next_in_table = NULL;
+    survivor->previous_in_table = NULL;
+    if (quic->cnx_wake_tree.root != &survivor->cnx_wake_node ||
+        quic->cnx_wake_tree.size != 1) {
+        quic->cnx_wake_tree.root = NULL;
+        quic->cnx_wake_tree.size = 0;
+        (void)picosplay_insert(&quic->cnx_wake_tree, survivor);
+    }
+}
+
+int cnx_preinsert_failure_test()
+{
+    int ret = 0;
+    int state_result = -1;
+    const picoquic_connection_id_t fixed_cid = TEST_CNX_ID(0x55);
+    picoquic_quic_t* quic = picoquic_create(
+        4, NULL, NULL, NULL, NULL, NULL, NULL,
+        cnx_failure_fixed_cid_callback, (void*)&fixed_cid, NULL,
+        0, NULL, NULL, NULL, 0);
+    picoquic_cnx_t* survivor = NULL;
+    picoquic_cnx_t* failed = NULL;
+    picoquic_cnx_handle_t survivor_handle = PICOQUIC_CNX_HANDLE_INVALID;
+
+    if (quic == NULL) {
+        return -1;
+    }
+    survivor = cnx_handle_create_connection(quic, 11);
+    if (survivor == NULL) {
+        ret = -1;
+    }
+    else {
+        survivor_handle = picoquic_get_cnx_handle(survivor);
+        failed = cnx_handle_create_connection(quic, 12);
+        if (failed != NULL ||
+            !cnx_failure_survivor_is_intact(
+                quic, survivor, survivor_handle, &state_result)) {
+            fprintf(stderr,
+                "Pre-insertion create failure: failed_null=%d state_ret=%d "
+                "first=%d last=%d count=%u wake_size=%d earliest=%d\n",
+                failed == NULL, state_result, quic->cnx_list == survivor,
+                quic->cnx_last == survivor,
+                quic->current_number_connections,
+                quic->cnx_wake_tree.size,
+                picoquic_get_earliest_cnx_to_wake(quic, UINT64_MAX) == survivor);
+            cnx_failure_restore_survivor_for_cleanup(quic, survivor);
+            ret = -1;
+        }
+    }
+    picoquic_free(quic);
+    return ret;
+}
+
+int cnx_unique_log_failure_test()
+{
+    int ret = 0;
+    int state_result = -1;
+    const picoquic_connection_id_t duplicate_icid = TEST_CNX_ID(0x66);
+    picoquic_quic_t* quic = picoquic_create(
+        4, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+        0, NULL, NULL, NULL, 0);
+    picoquic_cnx_t* survivor = NULL;
+    picoquic_cnx_t* failed = NULL;
+    picoquic_cnx_handle_t survivor_handle = PICOQUIC_CNX_HANDLE_INVALID;
+
+    if (quic == NULL) {
+        return -1;
+    }
+    survivor = cnx_handle_create_server_connection(
+        quic, duplicate_icid, 13);
+    if (survivor == NULL) {
+        ret = -1;
+    }
+    else {
+        survivor_handle = picoquic_get_cnx_handle(survivor);
+        picoquic_use_unique_log_names(quic, 1);
+        failed = cnx_handle_create_server_connection(
+            quic, duplicate_icid, 13);
+        if (failed != NULL ||
+            !cnx_failure_survivor_is_intact(
+                quic, survivor, survivor_handle, &state_result)) {
+            fprintf(stderr,
+                "Unique-log create failure: failed_null=%d state_ret=%d "
+                "first=%d last=%d count=%u wake_size=%d earliest=%d\n",
+                failed == NULL, state_result, quic->cnx_list == survivor,
+                quic->cnx_last == survivor,
+                quic->current_number_connections,
+                quic->cnx_wake_tree.size,
+                picoquic_get_earliest_cnx_to_wake(quic, UINT64_MAX) == survivor);
+            ret = -1;
+        }
+    }
+    picoquic_free(quic);
+    return ret;
+}
+
 int cnx_handle_test()
 {
     int ret = 0;
