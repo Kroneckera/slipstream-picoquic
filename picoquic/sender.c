@@ -4444,6 +4444,10 @@ static int picoquic_prepare_packet_internal(picoquic_cnx_t* cnx,
                 cnx, unique_path_id);
             if (resolved_path_id < 0 ||
                 cnx->path[resolved_path_id]->path_is_demoted) {
+                /* Selection may queue work and schedule an earlier wake. */
+                if (cnx->next_wake_time < next_wake_time) {
+                    next_wake_time = cnx->next_wake_time;
+                }
                 ret = PICOQUIC_ERROR_PATH_ID_INVALID;
                 goto prepare_packet_complete;
             }

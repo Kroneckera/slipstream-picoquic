@@ -494,11 +494,17 @@ static int prepare_by_unique_path_id_case(int probe_nat)
         next_wake_time = UINT64_MAX;
         picoquic_delete_abandoned_paths(
             cnx, selector_time, &next_wake_time);
+        while (cnx->first_misc_frame != NULL) {
+            picoquic_delete_misc_or_dg(
+                &cnx->first_misc_frame, &cnx->last_misc_frame,
+                cnx->first_misc_frame);
+        }
         int selector_index = picoquic_create_path(
             cnx, selector_time, (const struct sockaddr*)&local[1],
             (const struct sockaddr*)&peer[1], 4);
         if (cnx->nb_paths != 2 || selector_index != 1 ||
-            cnx->path[0] != default_path || cnx->path_demotion_needed) {
+            cnx->path[0] != default_path || cnx->path_demotion_needed ||
+            cnx->first_misc_frame != NULL || cnx->last_misc_frame != NULL) {
             DBG_PRINTF("Selector-demoted path index is %d, count=%d, unsettled=%u",
                 selector_index, cnx->nb_paths, cnx->path_demotion_needed);
             ret = -1;
@@ -519,25 +525,69 @@ static int prepare_by_unique_path_id_case(int probe_nat)
             }
             else {
                 size_t unprepared_msg_size = (size_t)-1;
+                uint64_t expected_wake_time = picoquic_get_quic_time(cnx->quic);
                 selector_path->p_remote_cnxid = selector_remote_cnxid;
                 selector_remote_cnxid->nb_path_references++;
                 selector_path->challenge_failed = 1;
                 send_length = 17;
                 send_msg_size = unprepared_msg_size;
+                memset(&addr_to, 0, sizeof(addr_to));
+                memset(&addr_from, 0, sizeof(addr_from));
+                if_index = -1;
+                picoquic_reinsert_by_wake_time(cnx->quic, cnx, UINT64_MAX);
                 ret = picoquic_prepare_packet_by_unique_path_id(
                     cnx, selector_path_id, selector_time, send_buffer,
                     sizeof(send_buffer), &send_length, &addr_to, &addr_from,
                     &if_index, &send_msg_size);
                 int resolved_index = picoquic_find_path_by_unique_id(
                     cnx, selector_path_id);
+                int queued_path_abandon = 0;
+                if (cnx->first_misc_frame != NULL) {
+                    const uint8_t* frame_bytes =
+                        ((const uint8_t*)cnx->first_misc_frame) +
+                        sizeof(picoquic_misc_frame_header_t);
+                    const uint8_t* frame_bytes_max = frame_bytes +
+                        cnx->first_misc_frame->length;
+                    uint64_t frame_type = 0;
+                    uint64_t frame_path_id = UINT64_MAX;
+                    frame_bytes = picoquic_frames_varint_decode(
+                        frame_bytes, frame_bytes_max, &frame_type);
+                    if (frame_bytes != NULL) {
+                        frame_bytes = picoquic_frames_varint_decode(
+                            frame_bytes, frame_bytes_max, &frame_path_id);
+                    }
+                    queued_path_abandon = frame_bytes != NULL &&
+                        frame_type == picoquic_frame_type_path_abandon &&
+                        frame_path_id == selector_path_id;
+                }
+                int selector_route_ok = picoquic_compare_addr(
+                        (const struct sockaddr*)&addr_to,
+                        (const struct sockaddr*)&default_path->peer_addr) == 0 &&
+                    picoquic_compare_addr(
+                        (const struct sockaddr*)&addr_from,
+                        (const struct sockaddr*)&default_path->local_addr) == 0 &&
+                    if_index == default_path->if_index_dest;
+                unsigned int requested_path_abandon_sent =
+                    resolved_index >= 0 && resolved_index < cnx->nb_paths ?
+                    cnx->path[resolved_index]->path_abandon_sent : 0;
                 if (ret != PICOQUIC_ERROR_PATH_ID_INVALID ||
                     send_length != 0 || resolved_index != 1 ||
                     !cnx->path[resolved_index]->path_is_demoted ||
                     cnx->path[resolved_index]->demotion_time <= selector_time ||
                     cnx->path[resolved_index]->p_remote_cnxid != NULL ||
+                    !cnx->path[resolved_index]->path_abandon_sent ||
+                    !queued_path_abandon ||
+                    cnx->next_wake_time != expected_wake_time ||
+                    picoquic_get_earliest_cnx_to_wake(
+                        cnx->quic, expected_wake_time) != cnx ||
+                    !selector_route_ok ||
                     send_msg_size != unprepared_msg_size) {
-                    DBG_PRINTF("Selector-demoted stable path returned %d, length=%zu, index=%d, msg=%zu",
-                        ret, send_length, resolved_index, send_msg_size);
+                    DBG_PRINTF("Selector-demoted stable path returned %d, length=%zu, index=%d, msg=%zu, wake=%" PRIu64 "/%" PRIu64 ", abandon=%d/%u, route=%d",
+                        ret, send_length, resolved_index, send_msg_size,
+                        cnx->next_wake_time, expected_wake_time,
+                        queued_path_abandon,
+                        requested_path_abandon_sent,
+                        selector_route_ok);
                     ret = -1;
                 }
                 else {
