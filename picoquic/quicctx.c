@@ -1381,6 +1381,7 @@ static void picoquic_insert_cnx_by_wake_time(picoquic_quic_t* quic, picoquic_cnx
 
 void picoquic_reinsert_by_wake_time(picoquic_quic_t* quic, picoquic_cnx_t* cnx, uint64_t next_time)
 {
+    cnx->wake_generation++;
     picoquic_remove_cnx_from_wake_list(cnx);
     cnx->next_wake_time = next_time;
     picoquic_insert_cnx_by_wake_time(quic, cnx);
@@ -5109,4 +5110,3 @@ uint64_t picoquic_uniform_random(uint64_t rnd_max)
 {
     return picoquic_public_uniform_random(rnd_max);
 }
-

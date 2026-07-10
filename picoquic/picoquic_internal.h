@@ -1381,6 +1381,8 @@ typedef struct st_picoquic_cnx_t {
 
     /* Next time sending data is expected */
     uint64_t next_wake_time;
+    uint64_t wake_generation;
+    uint64_t wake_generation_at_last_prepare;
     picosplay_node_t cnx_wake_node;
     /* Wakeup time requested by the application */
     uint64_t app_wake_time;

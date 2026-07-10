@@ -243,6 +243,15 @@ static void prepare_by_unique_path_id_clear_misc_frames(picoquic_cnx_t* cnx)
     }
 }
 
+static void prepare_by_unique_path_id_clear_datagrams(picoquic_cnx_t* cnx)
+{
+    while (cnx->first_datagram != NULL) {
+        picoquic_delete_misc_or_dg(
+            &cnx->first_datagram, &cnx->last_datagram,
+            cnx->first_datagram);
+    }
+}
+
 static int prepare_by_unique_path_id_has_abandon_frame(
     picoquic_cnx_t* cnx, uint64_t unique_path_id)
 {
@@ -268,6 +277,707 @@ static int prepare_by_unique_path_id_has_abandon_frame(
     }
 
     return has_abandon_frame;
+}
+
+typedef enum {
+    prepare_unique_callback_queue_datagram = 0,
+    prepare_unique_callback_set_app_wake,
+    prepare_unique_callback_reinsert
+} prepare_unique_callback_action_t;
+
+typedef struct st_prepare_unique_callback_ctx_t {
+    picoquic_stream_data_cb_fn previous_callback;
+    void* previous_callback_ctx;
+    prepare_unique_callback_action_t action;
+    uint64_t wake_time;
+    int path_deleted_count;
+    int action_ret;
+    uint64_t generation_before_action;
+    uint64_t generation_after_action;
+} prepare_unique_callback_ctx_t;
+
+typedef struct st_prepare_unique_fixture_t {
+    picoquic_test_tls_api_ctx_t* test_ctx;
+    picoquic_cnx_t* cnx;
+    uint64_t simulated_time;
+    uint64_t path_id;
+    prepare_unique_callback_ctx_t callback_ctx;
+    int callbacks_installed;
+    int path_callbacks_were_enabled;
+} prepare_unique_fixture_t;
+
+static int prepare_unique_path_deleted_callback(
+    picoquic_cnx_t* cnx, uint64_t stream_id, uint8_t* bytes,
+    size_t length, picoquic_call_back_event_t fin_or_event,
+    void* callback_ctx, void* stream_ctx)
+{
+    prepare_unique_callback_ctx_t* ctx =
+        (prepare_unique_callback_ctx_t*)callback_ctx;
+
+    if (fin_or_event == picoquic_callback_path_deleted) {
+        const uint8_t datagram_bytes[4] = { 0xd0, 0xd1, 0xd2, 0xd3 };
+
+        ctx->path_deleted_count++;
+        ctx->generation_before_action = cnx->wake_generation;
+        switch (ctx->action) {
+        case prepare_unique_callback_queue_datagram:
+            ctx->action_ret = picoquic_queue_datagram_frame(
+                cnx, sizeof(datagram_bytes), datagram_bytes);
+            break;
+        case prepare_unique_callback_set_app_wake:
+            picoquic_set_app_wake_time(cnx, ctx->wake_time);
+            ctx->action_ret = 0;
+            break;
+        case prepare_unique_callback_reinsert:
+            picoquic_reinsert_by_wake_time(
+                cnx->quic, cnx, ctx->wake_time);
+            ctx->action_ret = 0;
+            break;
+        default:
+            ctx->action_ret = -1;
+            break;
+        }
+        ctx->generation_after_action = cnx->wake_generation;
+        return ctx->action_ret;
+    }
+
+    if (ctx->previous_callback != NULL) {
+        return ctx->previous_callback(
+            cnx, stream_id, bytes, length, fin_or_event,
+            ctx->previous_callback_ctx, stream_ctx);
+    }
+    return 0;
+}
+
+static int prepare_unique_fixture_init(prepare_unique_fixture_t* fixture)
+{
+    uint64_t loss_mask = 0;
+    int ret;
+
+    memset(fixture, 0, sizeof(*fixture));
+    ret = tls_api_init_ctx(
+        &fixture->test_ctx, PICOQUIC_INTERNAL_TEST_VERSION_1,
+        PICOQUIC_TEST_SNI, PICOQUIC_TEST_ALPN,
+        &fixture->simulated_time, NULL, NULL, 0, 0, 0);
+    if (ret == 0) {
+        ret = tls_api_connection_loop(
+            fixture->test_ctx, &loss_mask, 0,
+            &fixture->simulated_time);
+    }
+    if (ret == 0) {
+        fixture->cnx = fixture->test_ctx->cnx_client;
+        if (fixture->cnx == NULL ||
+            (fixture->cnx->cnx_state != picoquic_state_ready &&
+             fixture->cnx->cnx_state != picoquic_state_client_ready_start)) {
+            ret = -1;
+        }
+    }
+    if (ret == 0) {
+        fixture->cnx->is_multipath_enabled = 1;
+        fixture->cnx->remote_parameters.max_datagram_frame_size =
+            PICOQUIC_MAX_PACKET_SIZE;
+        fixture->cnx->app_wake_time = 0;
+        fixture->cnx->is_lost_feedback_notification_required = 0;
+        prepare_by_unique_path_id_clear_misc_frames(fixture->cnx);
+        prepare_by_unique_path_id_clear_datagrams(fixture->cnx);
+    }
+    return ret;
+}
+
+static int prepare_unique_fixture_create_path(
+    prepare_unique_fixture_t* fixture)
+{
+    struct sockaddr_in peer;
+    struct sockaddr_in local;
+    int path_index;
+
+    memset(&peer, 0, sizeof(peer));
+    memset(&local, 0, sizeof(local));
+    peer.sin_family = AF_INET;
+    peer.sin_port = htons(7301);
+    peer.sin_addr.s_addr = htonl(0x7f000081u);
+    local.sin_family = AF_INET;
+    local.sin_port = htons(47001);
+    local.sin_addr.s_addr = htonl(0x7f000082u);
+    path_index = picoquic_create_path(
+        fixture->cnx, fixture->simulated_time,
+        (const struct sockaddr*)&local,
+        (const struct sockaddr*)&peer, 31);
+    if (path_index != 1) {
+        DBG_PRINTF("Wake fixture path index is %d, expected 1",
+            path_index);
+        return -1;
+    }
+    fixture->path_id =
+        fixture->cnx->path[path_index]->unique_path_id;
+    return 0;
+}
+
+static void prepare_unique_fixture_delete(
+    prepare_unique_fixture_t* fixture)
+{
+    if (fixture->callbacks_installed && fixture->cnx != NULL) {
+        picoquic_set_callback(
+            fixture->cnx, fixture->callback_ctx.previous_callback,
+            fixture->callback_ctx.previous_callback_ctx);
+        picoquic_enable_path_callbacks(
+            fixture->cnx, fixture->path_callbacks_were_enabled);
+    }
+    if (fixture->test_ctx != NULL) {
+        tls_api_delete_ctx(fixture->test_ctx);
+    }
+}
+
+static void prepare_unique_fixture_install_callback(
+    prepare_unique_fixture_t* fixture,
+    prepare_unique_callback_action_t action, uint64_t wake_time)
+{
+    fixture->callback_ctx.previous_callback =
+        picoquic_get_callback_function(fixture->cnx);
+    fixture->callback_ctx.previous_callback_ctx =
+        picoquic_get_callback_context(fixture->cnx);
+    fixture->callback_ctx.action = action;
+    fixture->callback_ctx.wake_time = wake_time;
+    fixture->callback_ctx.path_deleted_count = 0;
+    fixture->callback_ctx.action_ret = 0;
+    fixture->callback_ctx.generation_before_action = 0;
+    fixture->callback_ctx.generation_after_action = 0;
+    fixture->path_callbacks_were_enabled =
+        fixture->cnx->are_path_callbacks_enabled;
+    picoquic_set_callback(
+        fixture->cnx, prepare_unique_path_deleted_callback,
+        &fixture->callback_ctx);
+    picoquic_enable_path_callbacks(fixture->cnx, 1);
+    fixture->callbacks_installed = 1;
+}
+
+static int prepare_unique_fixture_arm_path_delete(
+    prepare_unique_fixture_t* fixture)
+{
+    int path_index = picoquic_find_path_by_unique_id(
+        fixture->cnx, fixture->path_id);
+
+    if (path_index <= 0 || path_index >= fixture->cnx->nb_paths) {
+        return -1;
+    }
+    fixture->cnx->path[path_index]->path_is_demoted = 1;
+    fixture->cnx->path[path_index]->demotion_time =
+        fixture->simulated_time;
+    fixture->cnx->path_demotion_needed = 1;
+    return 0;
+}
+
+static int prepare_unique_fixture_prepare(
+    prepare_unique_fixture_t* fixture, uint64_t unique_path_id,
+    size_t* send_length)
+{
+    struct sockaddr_storage addr_to;
+    struct sockaddr_storage addr_from;
+    uint8_t send_buffer[PICOQUIC_MAX_PACKET_SIZE];
+    size_t send_msg_size = 0;
+    int if_index = 0;
+
+    *send_length = 17;
+    return picoquic_prepare_packet_by_unique_path_id(
+        fixture->cnx, unique_path_id, fixture->simulated_time,
+        send_buffer, sizeof(send_buffer), send_length,
+        &addr_to, &addr_from, &if_index, &send_msg_size);
+}
+
+static int prepare_unique_fixture_prepare_ordinary(
+    prepare_unique_fixture_t* fixture, size_t* send_length)
+{
+    struct sockaddr_storage addr_to;
+    struct sockaddr_storage addr_from;
+    uint8_t send_buffer[PICOQUIC_MAX_PACKET_SIZE];
+    int if_index = 0;
+
+    *send_length = 17;
+    return picoquic_prepare_packet(
+        fixture->cnx, fixture->simulated_time,
+        send_buffer, sizeof(send_buffer), send_length,
+        &addr_to, &addr_from, &if_index);
+}
+
+static int prepare_unique_fixture_settle_initial_output(
+    prepare_unique_fixture_t* fixture)
+{
+    size_t send_length = 0;
+    int ret = 0;
+
+    for (int i = 0; ret == 0 && i < 8; i++) {
+        ret = prepare_unique_fixture_prepare_ordinary(
+            fixture, &send_length);
+        if (ret == 0 && send_length == 0 &&
+            fixture->cnx->next_wake_time > fixture->simulated_time) {
+            return 0;
+        }
+    }
+    DBG_PRINTF("Could not settle initial output: ret=%d, length=%zu, wake=%" PRIu64 "/%" PRIu64,
+        ret, send_length, fixture->cnx->next_wake_time,
+        fixture->simulated_time);
+    return -1;
+}
+
+static int prepare_unique_fixture_consume_due_wake(
+    prepare_unique_fixture_t* fixture)
+{
+    const uint8_t datagram_bytes[3] = { 0xc0, 0xc1, 0xc2 };
+    size_t send_length = 0;
+    int ret = prepare_unique_fixture_settle_initial_output(fixture);
+
+    if (ret == 0) {
+        ret = picoquic_queue_datagram_frame(
+            fixture->cnx, sizeof(datagram_bytes), datagram_bytes);
+    }
+
+    if (ret == 0) {
+        ret = prepare_unique_fixture_prepare_ordinary(
+            fixture, &send_length);
+    }
+    if (ret != 0 || send_length == 0 ||
+        fixture->cnx->first_datagram != NULL ||
+        fixture->cnx->last_datagram != NULL ||
+        fixture->cnx->next_wake_time != fixture->simulated_time) {
+        DBG_PRINTF("Could not consume fixture wake: ret=%d, length=%zu, queue=%d/%d, wake=%" PRIu64 "/%" PRIu64,
+            ret, send_length, fixture->cnx->first_datagram != NULL,
+            fixture->cnx->last_datagram != NULL,
+            fixture->cnx->next_wake_time, fixture->simulated_time);
+        ret = -1;
+    }
+    return ret;
+}
+
+static int prepare_unique_callback_datagram_case()
+{
+    prepare_unique_fixture_t fixture;
+    size_t reject_length = 0;
+    size_t drain_length = 0;
+    size_t settle_length = 0;
+    uint64_t reject_wake = 0;
+    int reject_misc = 0;
+    int reject_datagram = 0;
+    int reject_earliest = 0;
+    int reject_ret = 0;
+    int drain_ret = 0;
+    int settle_ret = 0;
+    int ret = prepare_unique_fixture_init(&fixture);
+
+    if (ret == 0) {
+        ret = prepare_unique_fixture_consume_due_wake(&fixture);
+    }
+    if (ret == 0) {
+        ret = prepare_unique_fixture_create_path(&fixture);
+    }
+    if (ret == 0) {
+        prepare_unique_fixture_install_callback(
+            &fixture, prepare_unique_callback_queue_datagram, 0);
+        ret = prepare_unique_fixture_arm_path_delete(&fixture);
+    }
+    if (ret == 0) {
+        reject_ret = prepare_unique_fixture_prepare(
+            &fixture, fixture.path_id, &reject_length);
+        reject_wake = fixture.cnx->next_wake_time;
+        reject_misc = fixture.cnx->first_misc_frame != NULL;
+        reject_datagram = fixture.cnx->first_datagram != NULL;
+        reject_earliest = picoquic_get_earliest_cnx_to_wake(
+            fixture.cnx->quic, fixture.simulated_time) == fixture.cnx;
+        drain_ret = prepare_unique_fixture_prepare_ordinary(
+            &fixture, &drain_length);
+        settle_ret = prepare_unique_fixture_prepare_ordinary(
+            &fixture, &settle_length);
+        if (reject_ret != PICOQUIC_ERROR_PATH_ID_INVALID ||
+            reject_length != 0 ||
+            fixture.callback_ctx.path_deleted_count != 1 ||
+            fixture.callback_ctx.action_ret != 0 ||
+            fixture.callback_ctx.generation_before_action ==
+                fixture.callback_ctx.generation_after_action ||
+            reject_misc || !reject_datagram ||
+            reject_wake != fixture.simulated_time || !reject_earliest ||
+            drain_ret != 0 || drain_length == 0 ||
+            fixture.cnx->first_datagram != NULL ||
+            settle_ret != 0 || settle_length != 0 ||
+            fixture.cnx->next_wake_time <= fixture.simulated_time) {
+            DBG_PRINTF("Deleted-path datagram drain invalid: reject=%d/%zu/%" PRIu64 "/%d/%d/%d, callback=%d/%d/%" PRIu64 "/%" PRIu64 ", drain=%d/%zu, settle=%d/%zu, datagram=%d, final_wake=%" PRIu64 "/%" PRIu64,
+                reject_ret, reject_length,
+                reject_wake, reject_misc, reject_datagram,
+                reject_earliest,
+                fixture.callback_ctx.path_deleted_count,
+                fixture.callback_ctx.action_ret,
+                fixture.callback_ctx.generation_before_action,
+                fixture.callback_ctx.generation_after_action,
+                drain_ret, drain_length, settle_ret, settle_length,
+                fixture.cnx->first_datagram != NULL,
+                fixture.cnx->next_wake_time, fixture.simulated_time);
+            ret = -1;
+        }
+    }
+    prepare_unique_fixture_delete(&fixture);
+    return ret;
+}
+
+static int prepare_unique_callback_reinsert_case(uint64_t wake_delta)
+{
+    prepare_unique_fixture_t fixture;
+    size_t send_length = 0;
+    int prepare_ret = 0;
+    int ret = prepare_unique_fixture_init(&fixture);
+
+    if (ret == 0) {
+        ret = prepare_unique_fixture_consume_due_wake(&fixture);
+    }
+    if (ret == 0) {
+        ret = prepare_unique_fixture_create_path(&fixture);
+    }
+    if (ret == 0) {
+        uint64_t callback_wake = fixture.simulated_time + wake_delta;
+        prepare_unique_fixture_install_callback(
+            &fixture, prepare_unique_callback_reinsert, callback_wake);
+        ret = prepare_unique_fixture_arm_path_delete(&fixture);
+        if (ret == 0) {
+            prepare_ret = prepare_unique_fixture_prepare(
+                &fixture, fixture.path_id, &send_length);
+            if (prepare_ret != PICOQUIC_ERROR_PATH_ID_INVALID ||
+                send_length != 0 ||
+                fixture.callback_ctx.path_deleted_count != 1 ||
+                fixture.callback_ctx.action_ret != 0 ||
+                fixture.callback_ctx.generation_before_action ==
+                    fixture.callback_ctx.generation_after_action ||
+                fixture.cnx->first_misc_frame != NULL ||
+                fixture.cnx->first_datagram != NULL ||
+                fixture.cnx->next_wake_time != callback_wake ||
+                picoquic_get_earliest_cnx_to_wake(
+                    fixture.cnx->quic, callback_wake) != fixture.cnx) {
+                DBG_PRINTF("Deleted-path reinsert delayed: delta=%" PRIu64 ", ret=%d/%zu, callback=%d/%d/%" PRIu64 "/%" PRIu64 ", wake=%" PRIu64 "/%" PRIu64 ", queue=%d/%d",
+                    wake_delta, prepare_ret, send_length,
+                    fixture.callback_ctx.path_deleted_count,
+                    fixture.callback_ctx.action_ret,
+                    fixture.callback_ctx.generation_before_action,
+                    fixture.callback_ctx.generation_after_action,
+                    fixture.cnx->next_wake_time, callback_wake,
+                    fixture.cnx->first_misc_frame != NULL,
+                    fixture.cnx->first_datagram != NULL);
+                ret = -1;
+            }
+        }
+    }
+    prepare_unique_fixture_delete(&fixture);
+    return ret;
+}
+
+static int prepare_unique_callback_app_wake_case()
+{
+    prepare_unique_fixture_t fixture;
+    size_t send_length = 0;
+    int prepare_ret = 0;
+    int ret = prepare_unique_fixture_init(&fixture);
+
+    if (ret == 0) {
+        ret = prepare_unique_fixture_consume_due_wake(&fixture);
+    }
+    if (ret == 0) {
+        ret = prepare_unique_fixture_create_path(&fixture);
+    }
+    if (ret == 0) {
+        uint64_t app_wake = fixture.simulated_time + 10000;
+        prepare_unique_fixture_install_callback(
+            &fixture, prepare_unique_callback_set_app_wake, app_wake);
+        ret = prepare_unique_fixture_arm_path_delete(&fixture);
+        if (ret == 0) {
+            prepare_ret = prepare_unique_fixture_prepare(
+                &fixture, fixture.path_id, &send_length);
+            if (prepare_ret != PICOQUIC_ERROR_PATH_ID_INVALID ||
+                send_length != 0 ||
+                fixture.callback_ctx.path_deleted_count != 1 ||
+                fixture.callback_ctx.action_ret != 0 ||
+                fixture.callback_ctx.generation_before_action !=
+                    fixture.callback_ctx.generation_after_action ||
+                fixture.cnx->app_wake_time != app_wake ||
+                fixture.cnx->next_wake_time != app_wake ||
+                picoquic_get_earliest_cnx_to_wake(
+                    fixture.cnx->quic, app_wake) != fixture.cnx ||
+                fixture.cnx->first_misc_frame != NULL ||
+                fixture.cnx->first_datagram != NULL ||
+                fixture.cnx->wake_generation_at_last_prepare !=
+                    fixture.cnx->wake_generation) {
+                DBG_PRINTF("Deleted-path app wake delayed: ret=%d/%zu, callback=%d/%d/%" PRIu64 "/%" PRIu64 ", app=%" PRIu64 "/%" PRIu64 ", wake=%" PRIu64 ", queue=%d/%d, generation=%" PRIu64 "/%" PRIu64,
+                    prepare_ret, send_length,
+                    fixture.callback_ctx.path_deleted_count,
+                    fixture.callback_ctx.action_ret,
+                    fixture.callback_ctx.generation_before_action,
+                    fixture.callback_ctx.generation_after_action,
+                    fixture.cnx->app_wake_time, app_wake,
+                    fixture.cnx->next_wake_time,
+                    fixture.cnx->first_misc_frame != NULL,
+                    fixture.cnx->first_datagram != NULL,
+                    fixture.cnx->wake_generation_at_last_prepare,
+                    fixture.cnx->wake_generation);
+                ret = -1;
+            }
+        }
+    }
+    prepare_unique_fixture_delete(&fixture);
+    return ret;
+}
+
+static int prepare_unique_future_entry_wake_case()
+{
+    prepare_unique_fixture_t fixture;
+    size_t send_length = 0;
+    int prepare_ret = 0;
+    int ret = prepare_unique_fixture_init(&fixture);
+
+    if (ret == 0) {
+        ret = prepare_unique_fixture_consume_due_wake(&fixture);
+    }
+    if (ret == 0) {
+        ret = prepare_unique_fixture_create_path(&fixture);
+    }
+    if (ret == 0) {
+        uint64_t future_wake = fixture.simulated_time + 20000;
+        picoquic_enable_path_callbacks(fixture.cnx, 0);
+        picoquic_reinsert_by_wake_time(
+            fixture.cnx->quic, fixture.cnx, future_wake);
+        ret = prepare_unique_fixture_arm_path_delete(&fixture);
+        if (ret == 0) {
+            prepare_ret = prepare_unique_fixture_prepare(
+                &fixture, fixture.path_id, &send_length);
+            if (prepare_ret != PICOQUIC_ERROR_PATH_ID_INVALID ||
+                send_length != 0 ||
+                fixture.cnx->next_wake_time != future_wake ||
+                picoquic_get_earliest_cnx_to_wake(
+                    fixture.cnx->quic, future_wake) != fixture.cnx ||
+                fixture.cnx->first_misc_frame != NULL ||
+                fixture.cnx->first_datagram != NULL ||
+                fixture.cnx->wake_generation_at_last_prepare !=
+                    fixture.cnx->wake_generation) {
+                DBG_PRINTF("Future entry wake lost: ret=%d/%zu, wake=%" PRIu64 "/%" PRIu64 ", queue=%d/%d, generation=%" PRIu64 "/%" PRIu64,
+                    prepare_ret, send_length,
+                    fixture.cnx->next_wake_time, future_wake,
+                    fixture.cnx->first_misc_frame != NULL,
+                    fixture.cnx->first_datagram != NULL,
+                    fixture.cnx->wake_generation_at_last_prepare,
+                    fixture.cnx->wake_generation);
+                ret = -1;
+            }
+        }
+    }
+    prepare_unique_fixture_delete(&fixture);
+    return ret;
+}
+
+static int prepare_unique_preentry_abandon_case()
+{
+    const uint8_t remote_cid_bytes[8] = {
+        0xa0, 0xa1, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7
+    };
+    const uint8_t reset_secret[PICOQUIC_RESET_SECRET_SIZE] = { 4 };
+    prepare_unique_fixture_t fixture;
+    picoquic_remote_cnxid_t* remote_cnxid = NULL;
+    size_t reject_length = 0;
+    size_t drain_length = 0;
+    size_t settle_length = 0;
+    int reject_ret = 0;
+    int drain_ret = 0;
+    int settle_ret = 0;
+    int ret = prepare_unique_fixture_init(&fixture);
+
+    if (ret == 0) {
+        ret = prepare_unique_fixture_consume_due_wake(&fixture);
+    }
+    if (ret == 0) {
+        ret = prepare_unique_fixture_create_path(&fixture);
+    }
+    if (ret == 0) {
+        int path_index = picoquic_find_path_by_unique_id(
+            fixture.cnx, fixture.path_id);
+        if (path_index != 1 || picoquic_stash_remote_cnxid(
+                fixture.cnx, 0, fixture.path_id, 0,
+                sizeof(remote_cid_bytes), remote_cid_bytes,
+                reset_secret, &remote_cnxid) != 0 ||
+            remote_cnxid == NULL) {
+            ret = -1;
+        }
+        else {
+            fixture.cnx->path[path_index]->p_remote_cnxid = remote_cnxid;
+            remote_cnxid->nb_path_references++;
+            picoquic_demote_path(
+                fixture.cnx, path_index, fixture.simulated_time, 0, NULL);
+            fixture.cnx->path[path_index]->demotion_time =
+                fixture.simulated_time;
+            if (!prepare_by_unique_path_id_has_abandon_frame(
+                    fixture.cnx, fixture.path_id) ||
+                fixture.cnx->next_wake_time != fixture.simulated_time) {
+                ret = -1;
+            }
+        }
+    }
+    if (ret == 0) {
+        reject_ret = prepare_unique_fixture_prepare(
+            &fixture, fixture.path_id, &reject_length);
+        int reject_wake_ok =
+            fixture.cnx->next_wake_time == fixture.simulated_time &&
+            picoquic_get_earliest_cnx_to_wake(
+                fixture.cnx->quic, fixture.simulated_time) == fixture.cnx;
+        drain_ret = prepare_unique_fixture_prepare_ordinary(
+            &fixture, &drain_length);
+        int abandon_drained = fixture.cnx->first_misc_frame == NULL;
+        settle_ret = prepare_unique_fixture_prepare_ordinary(
+            &fixture, &settle_length);
+        if (reject_ret != PICOQUIC_ERROR_PATH_ID_INVALID ||
+            reject_length != 0 || !reject_wake_ok ||
+            drain_ret != 0 || drain_length == 0 || !abandon_drained ||
+            settle_ret != 0 || settle_length != 0 ||
+            fixture.cnx->next_wake_time <= fixture.simulated_time) {
+            DBG_PRINTF("Pre-entry abandon replay invalid: reject=%d/%zu/%d, drain=%d/%zu/%d, settle=%d/%zu, wake=%" PRIu64 "/%" PRIu64,
+                reject_ret, reject_length, reject_wake_ok,
+                drain_ret, drain_length, abandon_drained,
+                settle_ret, settle_length,
+                fixture.cnx->next_wake_time, fixture.simulated_time);
+            ret = -1;
+        }
+    }
+    prepare_unique_fixture_delete(&fixture);
+    return ret;
+}
+
+static int prepare_unique_two_connection_wake_tree_case()
+{
+    picoquic_connection_id_t cid[2] = {
+        { { 0xb0, 0xb1, 0xb2, 0xb3, 0xb4, 0xb5, 0xb6, 0xb7 }, 8 },
+        { { 0xc0, 0xc1, 0xc2, 0xc3, 0xc4, 0xc5, 0xc6, 0xc7 }, 8 }
+    };
+    struct sockaddr_in addr[2];
+    picoquic_quic_t* quic = picoquic_create(
+        8, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+        0, NULL, NULL, NULL, 0);
+    picoquic_cnx_t* cnx[2] = { NULL, NULL };
+    int ret = quic == NULL ? -1 : 0;
+
+    memset(addr, 0, sizeof(addr));
+    for (int i = 0; i < 2; i++) {
+        addr[i].sin_family = AF_INET;
+        addr[i].sin_port = htons((uint16_t)(7400 + i));
+        addr[i].sin_addr.s_addr = htonl(0x7f000091u + (uint32_t)i);
+        if (ret == 0) {
+            cnx[i] = picoquic_create_cnx(
+                quic, cid[i], picoquic_null_connection_id,
+                (const struct sockaddr*)&addr[i],
+                (uint64_t)(100 + i), 0, NULL, NULL, 1);
+            if (cnx[i] == NULL) {
+                ret = -1;
+            }
+        }
+    }
+    if (ret == 0) {
+        uint64_t generation_0 = cnx[0]->wake_generation;
+        uint64_t generation_1 = cnx[1]->wake_generation;
+        picoquic_reinsert_by_wake_time(quic, cnx[0], 200);
+        picoquic_reinsert_by_wake_time(quic, cnx[1], 100);
+        if (quic->cnx_wake_tree.size != 2 ||
+            picoquic_get_earliest_cnx_to_wake(quic, 0) != cnx[1] ||
+            cnx[0]->wake_generation != generation_0 + 1 ||
+            cnx[1]->wake_generation != generation_1 + 1) {
+            ret = -1;
+        }
+    }
+    if (ret == 0) {
+        picoquic_reinsert_by_wake_time(quic, cnx[0], 50);
+        if (quic->cnx_wake_tree.size != 2 ||
+            picoquic_get_earliest_cnx_to_wake(quic, 0) != cnx[0]) {
+            ret = -1;
+        }
+    }
+    if (ret != 0 && quic != NULL) {
+        DBG_PRINTF("Two-connection wake tree invalid: size=%d, earliest=%p, cnx=%p/%p",
+            quic->cnx_wake_tree.size,
+            (void*)picoquic_get_earliest_cnx_to_wake(quic, 0),
+            (void*)cnx[0], (void*)cnx[1]);
+    }
+    if (quic != NULL) {
+        picoquic_free(quic);
+    }
+    return ret;
+}
+
+static int prepare_unique_generation_wrap_case()
+{
+    prepare_unique_fixture_t fixture;
+    size_t send_length = 0;
+    int prepare_ret = 0;
+    int ret = prepare_unique_fixture_init(&fixture);
+
+    if (ret == 0) {
+        ret = prepare_unique_fixture_consume_due_wake(&fixture);
+    }
+    if (ret == 0) {
+        ret = prepare_unique_fixture_create_path(&fixture);
+    }
+    if (ret == 0) {
+        prepare_unique_fixture_install_callback(
+            &fixture, prepare_unique_callback_reinsert,
+            fixture.simulated_time);
+        ret = prepare_unique_fixture_arm_path_delete(&fixture);
+    }
+    if (ret == 0) {
+        fixture.cnx->wake_generation = UINT64_MAX;
+        fixture.cnx->wake_generation_at_last_prepare = UINT64_MAX;
+        prepare_ret = prepare_unique_fixture_prepare(
+            &fixture, fixture.path_id, &send_length);
+        if (prepare_ret != PICOQUIC_ERROR_PATH_ID_INVALID ||
+            send_length != 0 ||
+            fixture.callback_ctx.path_deleted_count != 1 ||
+            fixture.callback_ctx.action_ret != 0 ||
+            fixture.callback_ctx.generation_before_action != UINT64_MAX ||
+            fixture.callback_ctx.generation_after_action != 0 ||
+            fixture.cnx->next_wake_time != fixture.simulated_time ||
+            fixture.cnx->wake_generation != 1 ||
+            fixture.cnx->wake_generation_at_last_prepare != 1) {
+            DBG_PRINTF("Wake generation wrap invalid: ret=%d/%zu, callback=%d/%d, callback_generation=%" PRIu64 "/%" PRIu64 ", final=%" PRIu64 "/%" PRIu64 ", wake=%" PRIu64 "/%" PRIu64,
+                prepare_ret, send_length,
+                fixture.callback_ctx.path_deleted_count,
+                fixture.callback_ctx.action_ret,
+                fixture.callback_ctx.generation_before_action,
+                fixture.callback_ctx.generation_after_action,
+                fixture.cnx->wake_generation,
+                fixture.cnx->wake_generation_at_last_prepare,
+                fixture.cnx->next_wake_time, fixture.simulated_time);
+            ret = -1;
+        }
+    }
+    prepare_unique_fixture_delete(&fixture);
+    return ret;
+}
+
+static int prepare_unique_wake_reconciliation_cases()
+{
+    int ret = 0;
+
+    if (prepare_unique_callback_datagram_case() != 0) {
+        ret = -1;
+    }
+    if (prepare_unique_callback_reinsert_case(0) != 0) {
+        ret = -1;
+    }
+    if (prepare_unique_callback_reinsert_case(1000) != 0) {
+        ret = -1;
+    }
+    if (prepare_unique_callback_app_wake_case() != 0) {
+        ret = -1;
+    }
+    if (prepare_unique_future_entry_wake_case() != 0) {
+        ret = -1;
+    }
+    if (prepare_unique_preentry_abandon_case() != 0) {
+        ret = -1;
+    }
+    if (prepare_unique_two_connection_wake_tree_case() != 0) {
+        ret = -1;
+    }
+    if (prepare_unique_generation_wrap_case() != 0) {
+        ret = -1;
+    }
+    return ret;
 }
 
 static int prepare_by_unique_path_id_case(int probe_nat)
@@ -455,7 +1165,8 @@ static int prepare_by_unique_path_id_case(int probe_nat)
         }
     }
     if (ret == 0) {
-        int disappearing_index;
+        const uint8_t consumed_datagram[3] = { 0xe0, 0xe1, 0xe2 };
+        int disappearing_index = -1;
         uint64_t due_wake_time = picoquic_get_quic_time(cnx->quic);
         uint64_t expected_future_wake = cnx->start_time +
             cnx->local_parameters.max_idle_timeout * 1000ull;
@@ -467,17 +1178,37 @@ static int prepare_by_unique_path_id_case(int probe_nat)
         cnx->app_wake_time = 0;
         cnx->is_lost_feedback_notification_required = 0;
         prepare_by_unique_path_id_clear_misc_frames(cnx);
-        picoquic_reinsert_by_wake_time(
-            cnx->quic, cnx, due_wake_time);
-        disappearing_index = picoquic_create_path(
-            cnx, simulated_time, (const struct sockaddr*)&local[1],
-            (const struct sockaddr*)&peer[1], 3);
-        if (disappearing_index != 2 || cnx->first_misc_frame != NULL ||
+        prepare_by_unique_path_id_clear_datagrams(cnx);
+        ret = picoquic_queue_datagram_frame(
+            cnx, sizeof(consumed_datagram), consumed_datagram);
+        if (ret == 0) {
+            send_length = 17;
+            ret = picoquic_prepare_packet(
+                cnx, simulated_time, send_buffer, sizeof(send_buffer),
+                &send_length, &addr_to, &addr_from, &if_index);
+        }
+        if (ret != 0 || send_length == 0 ||
+            cnx->first_datagram != NULL ||
+            cnx->last_datagram != NULL ||
+            cnx->next_wake_time != due_wake_time) {
+            DBG_PRINTF("Could not consume disappearing-path wake: ret=%d, length=%zu, queue=%d/%d, wake=%" PRIu64 "/%" PRIu64,
+                ret, send_length, cnx->first_datagram != NULL,
+                cnx->last_datagram != NULL, cnx->next_wake_time,
+                due_wake_time);
+            ret = -1;
+        }
+        if (ret == 0) {
+            disappearing_index = picoquic_create_path(
+                cnx, simulated_time, (const struct sockaddr*)&local[1],
+                (const struct sockaddr*)&peer[1], 3);
+        }
+        if (ret == 0 && (disappearing_index != 2 ||
+            cnx->first_misc_frame != NULL ||
             cnx->last_misc_frame != NULL ||
             cnx->cnx_state >= picoquic_state_ready ||
             cnx->quic->default_handshake_timeout != 0 ||
             cnx->local_parameters.max_idle_timeout == 0 ||
-            expected_future_wake <= due_wake_time) {
+            expected_future_wake <= due_wake_time)) {
             DBG_PRINTF("Disappearing path fixture invalid: index=%d, queue=%d/%d, state=%d, timeout=%" PRIu64 "/%" PRIu64 ", wake=%" PRIu64 "/%" PRIu64,
                 disappearing_index, cnx->first_misc_frame != NULL,
                 cnx->last_misc_frame != NULL, cnx->cnx_state,
@@ -486,7 +1217,7 @@ static int prepare_by_unique_path_id_case(int probe_nat)
                 due_wake_time, expected_future_wake);
             ret = -1;
         }
-        else {
+        else if (ret == 0) {
             uint64_t disappearing_path_id =
                 cnx->path[disappearing_index]->unique_path_id;
             cnx->path[disappearing_index]->path_is_demoted = 1;
@@ -781,6 +1512,7 @@ static int prepare_by_unique_path_id_case(int probe_nat)
 int prepare_by_unique_path_id_test()
 {
     int ret = prepare_by_unique_path_id_case(0);
+    int wake_ret;
 
     if (ret != 0) {
         DBG_PRINTF("%s", "Normal unique path preparation failed");
@@ -790,6 +1522,11 @@ int prepare_by_unique_path_id_test()
         if (ret != 0) {
             DBG_PRINTF("%s", "NAT unique path preparation failed");
         }
+    }
+    wake_ret = prepare_unique_wake_reconciliation_cases();
+    if (wake_ret != 0) {
+        DBG_PRINTF("%s", "Unique path wake reconciliation failed");
+        ret = -1;
     }
     return ret;
 }

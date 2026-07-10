@@ -4383,8 +4383,12 @@ static int picoquic_prepare_packet_internal(picoquic_cnx_t* cnx,
     uint64_t current_time, uint8_t* send_buffer, size_t send_buffer_max, size_t* send_length,
     struct sockaddr_storage * p_addr_to, struct sockaddr_storage * p_addr_from, int* if_index, size_t* send_msg_size)
 {
-
+    uint64_t entry_generation = cnx->wake_generation;
+    uint64_t last_prepare_generation =
+        cnx->wake_generation_at_last_prepare;
+    uint64_t entry_wake_time = cnx->next_wake_time;
     int ret = 0;
+    int unique_path_rejected = 0;
     picoquic_packet_t * packet = NULL;
     uint64_t initial_next_time;
     uint64_t next_wake_time = cnx->latest_receive_time + 2*PICOQUIC_MICROSEC_SILENCE_MAX;
@@ -4429,19 +4433,12 @@ static int picoquic_prepare_packet_internal(picoquic_cnx_t* cnx,
             resolved_path_id = picoquic_find_path_by_unique_id(
                 cnx, unique_path_id);
             if (resolved_path_id < 0) {
-                /* Cleanup may leave a PATH_ABANDON frame ready to send. */
-                if (cnx->first_misc_frame != NULL &&
-                    cnx->next_wake_time < next_wake_time) {
-                    next_wake_time = cnx->next_wake_time;
-                }
+                unique_path_rejected = 1;
                 ret = PICOQUIC_ERROR_PATH_ID_INVALID;
                 goto prepare_packet_complete;
             }
             if (cnx->path[resolved_path_id]->path_is_demoted) {
-                /* Cleanup must not replace an earlier queued-work wake. */
-                if (cnx->next_wake_time < next_wake_time) {
-                    next_wake_time = cnx->next_wake_time;
-                }
+                unique_path_rejected = 1;
                 ret = PICOQUIC_ERROR_PATH_ID_INVALID;
                 goto prepare_packet_complete;
             }
@@ -4456,10 +4453,7 @@ static int picoquic_prepare_packet_internal(picoquic_cnx_t* cnx,
                 cnx, unique_path_id);
             if (resolved_path_id < 0 ||
                 cnx->path[resolved_path_id]->path_is_demoted) {
-                /* Selection may queue work and schedule an earlier wake. */
-                if (cnx->next_wake_time < next_wake_time) {
-                    next_wake_time = cnx->next_wake_time;
-                }
+                unique_path_rejected = 1;
                 ret = PICOQUIC_ERROR_PATH_ID_INVALID;
                 goto prepare_packet_complete;
             }
@@ -4632,11 +4626,32 @@ static int picoquic_prepare_packet_internal(picoquic_cnx_t* cnx,
     }
 
 prepare_packet_complete:
-    if (ret == 0) {
-        ret = picoquic_program_app_wake_time(cnx, &next_wake_time);
+    if (unique_path_rejected) {
+        if (cnx->wake_generation != entry_generation) {
+            if (cnx->next_wake_time < next_wake_time) {
+                next_wake_time = cnx->next_wake_time;
+            }
+        }
+        else if (entry_wake_time > current_time) {
+            if (entry_wake_time < next_wake_time) {
+                next_wake_time = entry_wake_time;
+            }
+        }
+        else if (entry_generation != last_prepare_generation &&
+            entry_wake_time < next_wake_time) {
+            next_wake_time = entry_wake_time;
+        }
+    }
+    if (ret == 0 || unique_path_rejected) {
+        int app_ret = picoquic_program_app_wake_time(
+            cnx, &next_wake_time);
+        if (ret == 0) {
+            ret = app_ret;
+        }
     }
 
     picoquic_reinsert_by_wake_time(cnx->quic, cnx, next_wake_time);
+    cnx->wake_generation_at_last_prepare = cnx->wake_generation;
 
     return ret;
 }
