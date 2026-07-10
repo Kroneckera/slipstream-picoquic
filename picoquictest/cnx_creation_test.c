@@ -234,6 +234,42 @@ int create_cnx_test()
     return ret;
 }
 
+static void prepare_by_unique_path_id_clear_misc_frames(picoquic_cnx_t* cnx)
+{
+    while (cnx->first_misc_frame != NULL) {
+        picoquic_delete_misc_or_dg(
+            &cnx->first_misc_frame, &cnx->last_misc_frame,
+            cnx->first_misc_frame);
+    }
+}
+
+static int prepare_by_unique_path_id_has_abandon_frame(
+    picoquic_cnx_t* cnx, uint64_t unique_path_id)
+{
+    int has_abandon_frame = 0;
+
+    if (cnx->first_misc_frame != NULL) {
+        const uint8_t* frame_bytes =
+            ((const uint8_t*)cnx->first_misc_frame) +
+            sizeof(picoquic_misc_frame_header_t);
+        const uint8_t* frame_bytes_max = frame_bytes +
+            cnx->first_misc_frame->length;
+        uint64_t frame_type = 0;
+        uint64_t frame_path_id = UINT64_MAX;
+        frame_bytes = picoquic_frames_varint_decode(
+            frame_bytes, frame_bytes_max, &frame_type);
+        if (frame_bytes != NULL) {
+            frame_bytes = picoquic_frames_varint_decode(
+                frame_bytes, frame_bytes_max, &frame_path_id);
+        }
+        has_abandon_frame = frame_bytes != NULL &&
+            frame_type == picoquic_frame_type_path_abandon &&
+            frame_path_id == unique_path_id;
+    }
+
+    return has_abandon_frame;
+}
+
 static int prepare_by_unique_path_id_case(int probe_nat)
 {
     const uint8_t normal_remote_cid[8] = {
@@ -449,14 +485,29 @@ static int prepare_by_unique_path_id_case(int probe_nat)
         }
     }
     if (ret == 0 && !probe_nat) {
+        uint64_t expected_wake_time = picoquic_get_quic_time(cnx->quic);
+        prepare_by_unique_path_id_clear_misc_frames(cnx);
+        picoquic_reinsert_by_wake_time(cnx->quic, cnx, UINT64_MAX);
         picoquic_demote_path(cnx, 1, simulated_time, 0, NULL);
         int demoted_index = picoquic_find_path_by_unique_id(
             cnx, target_path_id);
+        unsigned int path_abandon_sent =
+            demoted_index >= 0 && demoted_index < cnx->nb_paths ?
+            cnx->path[demoted_index]->path_abandon_sent : 0;
+        int queued_path_abandon =
+            prepare_by_unique_path_id_has_abandon_frame(
+                cnx, target_path_id);
         if (demoted_index != 1 || !cnx->path[demoted_index]->path_is_demoted ||
             cnx->path[demoted_index]->demotion_time <= simulated_time ||
-            cnx->path[demoted_index]->p_remote_cnxid != NULL) {
-            DBG_PRINTF("Demoted path fixture invalid: index=%d, count=%d",
-                demoted_index, cnx->nb_paths);
+            cnx->path[demoted_index]->p_remote_cnxid != NULL ||
+            !path_abandon_sent || !queued_path_abandon ||
+            cnx->next_wake_time != expected_wake_time ||
+            picoquic_get_earliest_cnx_to_wake(
+                cnx->quic, expected_wake_time) != cnx) {
+            DBG_PRINTF("Demoted path fixture invalid: index=%d, count=%d, wake=%" PRIu64 "/%" PRIu64 ", abandon=%d/%u",
+                demoted_index, cnx->nb_paths, cnx->next_wake_time,
+                expected_wake_time, queued_path_abandon,
+                path_abandon_sent);
             ret = -1;
         }
         else {
@@ -465,9 +516,14 @@ static int prepare_by_unique_path_id_case(int probe_nat)
                 cnx, target_path_id, simulated_time, send_buffer,
                 sizeof(send_buffer), &send_length, &addr_to, &addr_from,
                 &if_index, &send_msg_size);
-            if (ret != PICOQUIC_ERROR_PATH_ID_INVALID || send_length != 0) {
-                DBG_PRINTF("Demoted stable path returned %d, length=%zu",
-                    ret, send_length);
+            if (ret != PICOQUIC_ERROR_PATH_ID_INVALID || send_length != 0 ||
+                cnx->next_wake_time != expected_wake_time ||
+                picoquic_get_earliest_cnx_to_wake(
+                    cnx->quic, expected_wake_time) != cnx) {
+                DBG_PRINTF("Demoted stable path returned %d, length=%zu, wake=%" PRIu64 "/%" PRIu64 ", abandon=%d/%u",
+                    ret, send_length, cnx->next_wake_time,
+                    expected_wake_time, queued_path_abandon,
+                    path_abandon_sent);
                 ret = -1;
             }
             else {
@@ -494,11 +550,7 @@ static int prepare_by_unique_path_id_case(int probe_nat)
         next_wake_time = UINT64_MAX;
         picoquic_delete_abandoned_paths(
             cnx, selector_time, &next_wake_time);
-        while (cnx->first_misc_frame != NULL) {
-            picoquic_delete_misc_or_dg(
-                &cnx->first_misc_frame, &cnx->last_misc_frame,
-                cnx->first_misc_frame);
-        }
+        prepare_by_unique_path_id_clear_misc_frames(cnx);
         int selector_index = picoquic_create_path(
             cnx, selector_time, (const struct sockaddr*)&local[1],
             (const struct sockaddr*)&peer[1], 4);
@@ -528,6 +580,19 @@ static int prepare_by_unique_path_id_case(int probe_nat)
                 uint64_t expected_wake_time = picoquic_get_quic_time(cnx->quic);
                 selector_path->p_remote_cnxid = selector_remote_cnxid;
                 selector_remote_cnxid->nb_path_references++;
+                picoquic_store_addr(
+                    &selector_path->nat_peer_addr,
+                    (const struct sockaddr*)&nat_peer);
+                picoquic_store_addr(
+                    &selector_path->nat_local_addr,
+                    (const struct sockaddr*)&nat_local);
+                selector_path->challenge_required = 1;
+                selector_path->challenge_verified = 0;
+                selector_path->response_required = 0;
+                selector_path->retransmit_timer = 1;
+                selector_path->nat_challenge_time = 0;
+                selector_path->nat_challenge_repeat_count =
+                    PICOQUIC_CHALLENGE_REPEAT_MAX;
                 selector_path->challenge_failed = 1;
                 send_length = 17;
                 send_msg_size = unprepared_msg_size;
@@ -541,25 +606,9 @@ static int prepare_by_unique_path_id_case(int probe_nat)
                     &if_index, &send_msg_size);
                 int resolved_index = picoquic_find_path_by_unique_id(
                     cnx, selector_path_id);
-                int queued_path_abandon = 0;
-                if (cnx->first_misc_frame != NULL) {
-                    const uint8_t* frame_bytes =
-                        ((const uint8_t*)cnx->first_misc_frame) +
-                        sizeof(picoquic_misc_frame_header_t);
-                    const uint8_t* frame_bytes_max = frame_bytes +
-                        cnx->first_misc_frame->length;
-                    uint64_t frame_type = 0;
-                    uint64_t frame_path_id = UINT64_MAX;
-                    frame_bytes = picoquic_frames_varint_decode(
-                        frame_bytes, frame_bytes_max, &frame_type);
-                    if (frame_bytes != NULL) {
-                        frame_bytes = picoquic_frames_varint_decode(
-                            frame_bytes, frame_bytes_max, &frame_path_id);
-                    }
-                    queued_path_abandon = frame_bytes != NULL &&
-                        frame_type == picoquic_frame_type_path_abandon &&
-                        frame_path_id == selector_path_id;
-                }
+                int queued_path_abandon =
+                    prepare_by_unique_path_id_has_abandon_frame(
+                        cnx, selector_path_id);
                 int selector_route_ok = picoquic_compare_addr(
                         (const struct sockaddr*)&addr_to,
                         (const struct sockaddr*)&default_path->peer_addr) == 0 &&
@@ -567,6 +616,23 @@ static int prepare_by_unique_path_id_case(int probe_nat)
                         (const struct sockaddr*)&addr_from,
                         (const struct sockaddr*)&default_path->local_addr) == 0 &&
                     if_index == default_path->if_index_dest;
+                int forced_challenge_skipped =
+                    selector_path->nat_local_addr.ss_family == AF_INET &&
+                    picoquic_compare_addr(
+                        (const struct sockaddr*)&selector_path->nat_local_addr,
+                        (const struct sockaddr*)&nat_local) == 0 &&
+                    picoquic_compare_addr(
+                        (const struct sockaddr*)&selector_path->nat_peer_addr,
+                        (const struct sockaddr*)&nat_peer) == 0 &&
+                    cnx->is_multipath_enabled &&
+                    selector_path->challenge_required &&
+                    !selector_path->challenge_verified &&
+                    !selector_path->response_required &&
+                    selector_path->nat_challenge_time == 0 &&
+                    selector_time > selector_path->nat_challenge_time +
+                        selector_path->retransmit_timer &&
+                    selector_path->nat_challenge_repeat_count ==
+                        PICOQUIC_CHALLENGE_REPEAT_MAX;
                 unsigned int requested_path_abandon_sent =
                     resolved_index >= 0 && resolved_index < cnx->nb_paths ?
                     cnx->path[resolved_index]->path_abandon_sent : 0;
@@ -581,13 +647,16 @@ static int prepare_by_unique_path_id_case(int probe_nat)
                     picoquic_get_earliest_cnx_to_wake(
                         cnx->quic, expected_wake_time) != cnx ||
                     !selector_route_ok ||
+                    !forced_challenge_skipped ||
                     send_msg_size != unprepared_msg_size) {
-                    DBG_PRINTF("Selector-demoted stable path returned %d, length=%zu, index=%d, msg=%zu, wake=%" PRIu64 "/%" PRIu64 ", abandon=%d/%u, route=%d",
+                    DBG_PRINTF("Selector-demoted stable path returned %d, length=%zu, index=%d, msg=%zu, wake=%" PRIu64 "/%" PRIu64 ", abandon=%d/%u, route=%d, nat=%d/%u/%" PRIu64,
                         ret, send_length, resolved_index, send_msg_size,
                         cnx->next_wake_time, expected_wake_time,
                         queued_path_abandon,
                         requested_path_abandon_sent,
-                        selector_route_ok);
+                        selector_route_ok, forced_challenge_skipped,
+                        selector_path->nat_challenge_repeat_count,
+                        selector_path->nat_challenge_time);
                     ret = -1;
                 }
                 else {
