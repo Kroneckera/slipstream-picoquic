@@ -51,6 +51,7 @@ static const picoquic_test_def_t test_table[] = {
     { "picohash", picohash_test },
     { "picohash_embedded", picohash_embedded_test },
     { "bytestream", bytestream_test },
+    { "sockloop_wake_full_pipe", sockloop_wake_full_pipe_test },
     { "sockloop_basic", sockloop_basic_test },
     { "sockloop_eio", sockloop_eio_test },
     { "sockloop_errsock", sockloop_errsock_test },

@@ -75,6 +75,7 @@
 #endif
 #include <arpa/inet.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <netdb.h>
 #include <netinet/in.h>
 #include <sys/select.h>
@@ -1119,6 +1120,38 @@ int picoquic_packet_loop(picoquic_quic_t* quic,
 
 /* Management of background thread. */
 
+#ifndef _WINDOWS
+static void picoquic_close_wake_pipe_fd(int* fd)
+{
+    if (*fd >= 0) {
+        if (close(*fd) != 0) {
+            DBG_PRINTF("Cannot close network wake pipe, error 0x%x", errno);
+        }
+        *fd = -1;
+    }
+}
+
+static int picoquic_set_wake_pipe_nonblocking(int fd)
+{
+    int pipe_flags;
+    int fcntl_ret;
+
+    do {
+        pipe_flags = fcntl(fd, F_GETFL);
+    } while (pipe_flags < 0 && errno == EINTR);
+
+    if (pipe_flags < 0) {
+        return errno;
+    }
+
+    do {
+        fcntl_ret = fcntl(fd, F_SETFL, pipe_flags | O_NONBLOCK);
+    } while (fcntl_ret < 0 && errno == EINTR);
+
+    return (fcntl_ret < 0) ? errno : 0;
+}
+#endif
+
 static void picoquic_close_network_wake_up(picoquic_network_thread_ctx_t* thread_ctx)
 {
     if (thread_ctx->wake_up_defined) {
@@ -1126,7 +1159,7 @@ static void picoquic_close_network_wake_up(picoquic_network_thread_ctx_t* thread
         CloseHandle(thread_ctx->wake_up_event);
 #else
         for (int i = 0; i < 2; i++) {
-            (void)close(thread_ctx->wake_up_pipe_fd[i]);
+            picoquic_close_wake_pipe_fd(&thread_ctx->wake_up_pipe_fd[i]);
         }
 #endif
         thread_ctx->wake_up_defined = 0;
@@ -1145,12 +1178,21 @@ void picoquic_open_network_wake_up(picoquic_network_thread_ctx_t* thread_ctx, in
         thread_ctx->wake_up_defined = 1;
     }
 #else
+    thread_ctx->wake_up_pipe_fd[0] = -1;
+    thread_ctx->wake_up_pipe_fd[1] = -1;
     if (pipe(thread_ctx->wake_up_pipe_fd) != 0) {
         *ret = errno;
     }
-    else
-    {
-        thread_ctx->wake_up_defined = 1;
+    else {
+        int pipe_ret = picoquic_set_wake_pipe_nonblocking(thread_ctx->wake_up_pipe_fd[1]);
+        if (pipe_ret != 0) {
+            picoquic_close_wake_pipe_fd(&thread_ctx->wake_up_pipe_fd[0]);
+            picoquic_close_wake_pipe_fd(&thread_ctx->wake_up_pipe_fd[1]);
+            *ret = pipe_ret;
+        }
+        else {
+            thread_ctx->wake_up_defined = 1;
+        }
     }
 #endif
 }
@@ -1256,14 +1298,20 @@ int picoquic_wake_up_network_thread(picoquic_network_thread_ctx_t* thread_ctx)
             ret = (int)err;
         }
 #else
-        /* TODO: write to network pipe */
-        ssize_t written = 0;
-        if ((written = write(thread_ctx->wake_up_pipe_fd[1], &ret, 1)) != 1) {
-            if (written == 0) {
-                ret = EPIPE;
-            }
-            else {
-                ret = errno;
+        uint8_t wake_byte = 0;
+        ssize_t written;
+
+        do {
+            written = write(thread_ctx->wake_up_pipe_fd[1], &wake_byte, 1);
+        } while (written < 0 && errno == EINTR);
+
+        if (written == 0) {
+            ret = EPIPE;
+        }
+        else if (written < 0) {
+            int write_error = errno;
+            if (write_error != EAGAIN && write_error != EWOULDBLOCK) {
+                ret = write_error;
             }
         }
 #endif

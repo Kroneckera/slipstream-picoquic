@@ -30,6 +30,14 @@
 #include "picoquic_packet_loop.h"
 #include "picosocks.h"
 
+#ifndef _WINDOWS
+#include <errno.h>
+#include <fcntl.h>
+#include <pthread.h>
+#include <time.h>
+#include <unistd.h>
+#endif
+
 
 #ifndef SLEEP
 #ifdef _WINDOWS
@@ -82,6 +90,153 @@ typedef struct st_sockloop_test_cb_t {
     picoquic_connection_id_t client_cid_before_migration;
     picoquic_packet_loop_param_t* param;
 } sockloop_test_cb_t;
+
+#ifndef _WINDOWS
+typedef struct st_sockloop_wake_test_ctx_t {
+    picoquic_network_thread_ctx_t* thread_ctx;
+    pthread_mutex_t mutex;
+    pthread_cond_t cond;
+    int is_complete;
+    int wake_ret;
+} sockloop_wake_test_ctx_t;
+
+static picoquic_thread_return_t sockloop_wake_test_thread(void* v_ctx)
+{
+    sockloop_wake_test_ctx_t* wake_ctx = (sockloop_wake_test_ctx_t*)v_ctx;
+    int wake_ret = picoquic_wake_up_network_thread(wake_ctx->thread_ctx);
+
+    (void)pthread_mutex_lock(&wake_ctx->mutex);
+    wake_ctx->wake_ret = wake_ret;
+    wake_ctx->is_complete = 1;
+    (void)pthread_cond_signal(&wake_ctx->cond);
+    (void)pthread_mutex_unlock(&wake_ctx->mutex);
+
+    picoquic_thread_do_return;
+}
+#endif
+
+int sockloop_wake_full_pipe_test()
+{
+#ifdef _WINDOWS
+    return 0;
+#else
+    picoquic_network_thread_ctx_t thread_ctx = { 0 };
+    sockloop_wake_test_ctx_t wake_ctx = { 0 };
+    picoquic_thread_t wake_thread;
+    uint8_t wake_byte = 0;
+    int pipe_flags = -1;
+    int is_thread_created = 0;
+    int is_mutex_created = 0;
+    int is_cond_created = 0;
+    int is_complete_before_timeout = 0;
+    int ret = 0;
+
+    picoquic_open_network_wake_up(&thread_ctx, &ret);
+    if (ret != 0 || !thread_ctx.wake_up_defined) {
+        DBG_PRINTF("Cannot create wake pipe, ret = %d", ret);
+        ret = -1;
+    }
+
+    if (ret == 0 && (pipe_flags = fcntl(thread_ctx.wake_up_pipe_fd[1], F_GETFL)) < 0) {
+        DBG_PRINTF("Cannot read wake pipe flags, errno = %d", errno);
+        ret = -1;
+    }
+    else if (ret == 0 && (pipe_flags & O_NONBLOCK) == 0 &&
+        fcntl(thread_ctx.wake_up_pipe_fd[1], F_SETFL, pipe_flags | O_NONBLOCK) != 0) {
+        DBG_PRINTF("Cannot set wake pipe nonblocking for fill, errno = %d", errno);
+        ret = -1;
+    }
+
+    while (ret == 0) {
+        ssize_t written = write(thread_ctx.wake_up_pipe_fd[1], &wake_byte, 1);
+        if (written == 1) {
+            continue;
+        }
+        else if (written < 0 && errno == EINTR) {
+            continue;
+        }
+        else if (written < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            break;
+        }
+        else {
+            DBG_PRINTF("Unexpected wake pipe fill result, written = %d, errno = %d", (int)written, errno);
+            ret = -1;
+        }
+    }
+
+    if (ret == 0 && (pipe_flags & O_NONBLOCK) == 0 &&
+        fcntl(thread_ctx.wake_up_pipe_fd[1], F_SETFL, pipe_flags) != 0) {
+        DBG_PRINTF("Cannot restore wake pipe flags, errno = %d", errno);
+        ret = -1;
+    }
+
+    wake_ctx.thread_ctx = &thread_ctx;
+    if (ret == 0 && pthread_mutex_init(&wake_ctx.mutex, NULL) != 0) {
+        DBG_PRINTF("%s", "Cannot create wake test mutex");
+        ret = -1;
+    }
+    else if (ret == 0) {
+        is_mutex_created = 1;
+    }
+    if (ret == 0 && pthread_cond_init(&wake_ctx.cond, NULL) != 0) {
+        DBG_PRINTF("%s", "Cannot create wake test condition");
+        ret = -1;
+    }
+    else if (ret == 0) {
+        is_cond_created = 1;
+    }
+    if (ret == 0 && picoquic_create_thread(&wake_thread, sockloop_wake_test_thread, &wake_ctx) != 0) {
+        DBG_PRINTF("%s", "Cannot create wake test thread");
+        ret = -1;
+    }
+    else if (ret == 0) {
+        struct timespec deadline;
+        int wait_ret = 0;
+        is_thread_created = 1;
+        (void)clock_gettime(CLOCK_REALTIME, &deadline);
+        deadline.tv_sec++;
+
+        (void)pthread_mutex_lock(&wake_ctx.mutex);
+        while (!wake_ctx.is_complete && wait_ret == 0) {
+            wait_ret = pthread_cond_timedwait(&wake_ctx.cond, &wake_ctx.mutex, &deadline);
+        }
+        is_complete_before_timeout = wake_ctx.is_complete;
+        (void)pthread_mutex_unlock(&wake_ctx.mutex);
+
+        if (!is_complete_before_timeout) {
+            ssize_t pipe_recv;
+            do {
+                pipe_recv = read(thread_ctx.wake_up_pipe_fd[0], &wake_byte, 1);
+            } while (pipe_recv < 0 && errno == EINTR);
+        }
+    }
+
+    if (is_thread_created) {
+        (void)picoquic_wait_thread(wake_thread);
+    }
+    if (ret == 0 && !is_complete_before_timeout) {
+        DBG_PRINTF("%s", "Wake call blocked on a full pipe");
+        ret = -1;
+    }
+    else if (ret == 0 && wake_ctx.wake_ret != 0) {
+        DBG_PRINTF("Wake call on full pipe returns %d", wake_ctx.wake_ret);
+        ret = -1;
+    }
+
+    if (is_cond_created) {
+        (void)pthread_cond_destroy(&wake_ctx.cond);
+    }
+    if (is_mutex_created) {
+        (void)pthread_mutex_destroy(&wake_ctx.mutex);
+    }
+    if (thread_ctx.wake_up_defined) {
+        (void)close(thread_ctx.wake_up_pipe_fd[0]);
+        (void)close(thread_ctx.wake_up_pipe_fd[1]);
+    }
+
+    return ret;
+#endif
+}
 
 int sockloop_test_received_finished(picoquic_test_tls_api_ctx_t* test_ctx)
 {
