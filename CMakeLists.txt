@@ -523,12 +523,20 @@ install(FILES
 
 include(CMakePackageConfigHelpers)
 
-execute_process(
-    COMMAND git rev-parse --short HEAD
-    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
-    OUTPUT_VARIABLE GIT_HASH
-    OUTPUT_STRIP_TRAILING_WHITESPACE
-)
+set(GIT_HASH "source")
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/.git")
+    execute_process(
+        COMMAND git rev-parse --short HEAD
+        WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+        OUTPUT_VARIABLE GIT_HASH
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        ERROR_QUIET
+        RESULT_VARIABLE GIT_HASH_RESULT
+    )
+    if(NOT GIT_HASH_RESULT EQUAL 0 OR GIT_HASH STREQUAL "")
+        set(GIT_HASH "source")
+    endif()
+endif()
 
 set(PROJECT_VERSION "0.0.0-${GIT_HASH}")
 message(STATUS "Project version: ${PROJECT_VERSION}")
