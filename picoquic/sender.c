@@ -3310,6 +3310,16 @@ int picoquic_prepare_packet_almost_ready(picoquic_cnx_t* cnx, picoquic_path_t* p
                         }
                     }
                 } /* end of congestion blocked */
+
+                /* Poll-only packets retrieve the response that completes the
+                 * handshake, so they must remain sendable while the data
+                 * window is saturated. */
+                if (ret == 0 && cnx->is_poll_requested &&
+                    length <= header_length && bytes_next < bytes_max) {
+                    *bytes_next++ = picoquic_frame_type_poll;
+                    length++;
+                    cnx->is_poll_requested = 0;
+                }
             } /* end of CC */
         } /* End of pacing */
         if (length <= header_length) {
@@ -3703,15 +3713,16 @@ int picoquic_prepare_packet_ready(picoquic_cnx_t* cnx, picoquic_path_t* path_x, 
                         }
                     }
 
-                    // if we didn't add any frames, we need to check if we need to send a ping frame
-                    if (ret == 0 && cnx->is_poll_requested && length <= header_length) {
-                        if (bytes_next < bytes_max) {
-                            *bytes_next++ = picoquic_frame_type_poll;
-                            length++;
-                            cnx->is_poll_requested = 0;
-                        }
-                    }
                 } /* end of CC */
+
+                /* Poll-only packets retrieve congestion feedback, so they
+                 * must remain sendable while the data window is saturated. */
+                if (ret == 0 && cnx->is_poll_requested &&
+                    length <= header_length && bytes_next < bytes_max) {
+                    *bytes_next++ = picoquic_frame_type_poll;
+                    length++;
+                    cnx->is_poll_requested = 0;
+                }
             } /* End of pacing */
             else if (cnx->priority_limit_for_bypass > 0 && cnx->nb_paths == 1 &&
                 picoquic_is_authorized_by_pacing(&cnx->priority_bypass_pacing, current_time, next_wake_time,
